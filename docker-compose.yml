@@ -1,0 +1,25 @@
+# Tên container / image / project lấy từ file .env (APP_NAME, COMPOSE_PROJECT_NAME)
+services:
+  app:
+    build: .
+    container_name: ${APP_NAME:-ai-trading-office}
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    env_file:
+      - .env            # OFFICE_ADMIN_PASSWORD=...  (không commit file này)
+    environment:
+      - TZ=Asia/Ho_Chi_Minh
+      - OFFICE_STEP_DELAY=2.5
+      # - OFFICE_INSECURE_SSL=1   # bật nếu máy chủ thiếu CA bundle
+    volumes:
+      - ./data:/app/data
+      - ./skills:/app/skills
+      # Gắn code trực tiếp: sửa server.py / static rồi `docker compose restart` là xong, không cần build lại
+      - ./server.py:/app/server.py:ro
+      - ./static:/app/static:ro
+    mem_limit: 256m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

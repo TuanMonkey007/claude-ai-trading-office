@@ -1,0 +1,18 @@
+# Dữ liệu & bí mật — không bao giờ commit
+data/
+.env
+.deploy.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Hệ điều hành / log / DB
+.DS_Store
+*.log
+office.db*
+*.tgz
+
+# Windows scripts (chạy trên VPS, không cần trên Mac)
+deploy-windows.ps1
+setup-windows-service.ps1
