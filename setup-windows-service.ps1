@@ -51,13 +51,20 @@ Write-Host "NSSM: $nssmExe" -ForegroundColor Green
 
 # 4. Cài service
 Write-Host "Cài đặt service $SERVICE_NAME..." -ForegroundColor Yellow
+$existing = Get-Service -Name $SERVICE_NAME -ErrorAction SilentlyContinue
+if ($existing) {
+    Write-Host "Service đã tồn tại -> xoá và reinstall..." -ForegroundColor Yellow
+    Stop-Service -Name $SERVICE_NAME -Force -ErrorAction SilentlyContinue
+    & $nssmExe remove $SERVICE_NAME -y 2>$null | Out-Null
+    Start-Sleep 2
+}
 & $nssmExe install $SERVICE_NAME "$PYTHON_EXE" "$SCRIPT_PATH"
 & $nssmExe set $SERVICE_NAME AppDirectory $REPO_DIR
 & $nssmExe set $SERVICE_NAME AppStdout "$REPO_DIR\server.log"
 & $nssmExe set $SERVICE_NAME AppStderr "$REPO_DIR\server_err.log"
-& $nssmExe set $SERVICE_NAME AppEnvironmentExtra "PYTHONIOENCODING=utf-8"
+& $nssmExe set $SERVICE_NAME AppEnvironmentExtra "PYTHONIOENCODING=utf-8`nOFFICE_PORT=18080"
 & $nssmExe set $SERVICE_NAME Start SERVICE_AUTO_START
-& $nssmExe set $SERVICE_NAME Description "AI Trading Office - Python Server"
+& $nssmExe set $SERVICE_NAME Description "AI Trading Office - Python Server (port 18080)"
 
 # 5. Khởi động
 Write-Host "Khởi động service..." -ForegroundColor Yellow
@@ -70,6 +77,7 @@ Write-Host "Service status: $status" -ForegroundColor Green
 # 6. Health check
 Start-Sleep 2
 $healthUrl = "http://127.0.0.1:18080/api/health"
+Write-Host "Health check: $healthUrl" -ForegroundColor Yellow
 try {
     $resp = Invoke-WebRequest -Uri $healthUrl -TimeoutSec 10 -UseBasicParsing
     if ($resp.StatusCode -eq 200) { Write-Host "✅ Health check OK" -ForegroundColor Green }
