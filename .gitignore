@@ -12,7 +12,3 @@ __pycache__/
 *.log
 office.db*
 *.tgz
-
-# Windows scripts (chạy trên VPS, không cần trên Mac)
-deploy-windows.ps1
-setup-windows-service.ps1
