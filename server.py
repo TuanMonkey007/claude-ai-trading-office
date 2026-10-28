@@ -4429,6 +4429,13 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "AITradingOffice/1.0"
     timeout = 20          # timeout socket mỗi kết nối: chặn client treo giữ luồng mãi
 
+    def end_headers(self):
+        # Báo rõ đóng kết nối sau mỗi phản hồi. Thiếu header này, WebRequest của MT5 (WinInet) cố dùng lại
+        # kết nối mà server đã đóng => cứ 1 lần OK lại 1 lần lỗi 1003 (tỷ lệ gửi giá chỉ ~50%).
+        self.send_header("Connection", "close")
+        self.close_connection = True
+        BaseHTTPRequestHandler.end_headers(self)
+
     def log_message(self, fmt, *args):
         if os.environ.get("OFFICE_HTTP_LOG") == "1":
             super().log_message(fmt, *args)
