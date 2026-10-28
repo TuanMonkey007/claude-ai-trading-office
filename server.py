@@ -111,7 +111,7 @@ DEFAULT_CONFIG = {
     "cryptocompare_api_key": "",
     "bridge_token": "",
     "ea_poll_seconds": 15, "ea_web_timeout_ms": 8000, "ea_report_executions": True,
-    "ea_enable_price_bridge": True, "ea_tick_interval_ms": 1000, "ea_candle_interval_sec": 15, "ea_bridge_bars": 300,
+    "ea_enable_price_bridge": True, "ea_tick_interval_ms": 1000, "ea_candle_interval_sec": 15, "ea_bridge_bars": 1000,
     "ea_min_confidence": 80, "ea_max_signal_age_sec": 300, "ea_gold_symbol": "XAUUSDm", "ea_btc_symbol": "BTCUSDm",
     "ea_max_open_per_symbol": 1, "ea_use_server_lot": False, "ea_risk_percent": 1.0, "ea_split_tp": True,
     "ea_breakeven_buffer_pts": 0, "ea_max_daily_loss_pct": 3.0, "ea_dry_run": True, "ea_enable_trading": False,
@@ -134,6 +134,9 @@ DEFAULT_CONFIG = {
     "auto_interval_min": 30,
     "quant_consensus": 0.4,                   # ngưỡng đồng thuận = |điểm có trọng số| / tổng trọng số
     "agent_auto_weight": True,                # tự động điều chỉnh trọng số agent theo tỷ lệ thắng/thua SL/TP thực tế (từ 5 phiếu)
+    "max_same_dir_open": 1,                   # số kèo thật đang mở cùng tài sản cùng chiều tối đa; đạt ngưỡng thì kèo mới bị hạ WAIT (0 = tắt)
+    "cooldown_after_sl_min": 45,              # sau khi 1 kèo cùng tài sản cùng chiều đóng lỗ, không ra kèo chiều đó trong N phút (0 = tắt)
+    "block_negative_setups": True,            # hạ WAIT khi setup hiện tại đã có ≥ 15 lệnh mà kỳ vọng R < 0
     "llm_provider_order": ["gemini", "groq", "openrouter", "custom"],  # thứ tự gọi nhà cung cấp LLM khi ra quyết định (kéo thả trong Cài đặt)
 }
 SECRET_KEYS = ["gemini_api_key", "groq_api_key", "openrouter_api_key",
@@ -149,6 +152,12 @@ def load_config():
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             cfg.update(json.load(f))
     except Exception:
+        save_config(cfg)
+        return cfg
+    # Chuyển đổi 1 lần: 300 nến (mặc định cũ) không đủ cho EMA200 -> 1000 nến
+    if int(cfg.get("ea_bridge_bars") or 0) == 300 and not cfg.get("_mig_bridge_bars_1000"):
+        cfg["ea_bridge_bars"] = 1000
+        cfg["_mig_bridge_bars_1000"] = True
         save_config(cfg)
     return cfg
 
@@ -253,7 +262,10 @@ def db_init():
             close_time TEXT DEFAULT '',
             net_profit REAL DEFAULT 0,
             lesson_logged INTEGER DEFAULT 0,
-            telegram_alerted INTEGER DEFAULT 0
+            telegram_alerted INTEGER DEFAULT 0,
+            mfe REAL, mae REAL, mfe_r REAL, mae_r REAL, risk_dist REAL,
+            mfe_class TEXT DEFAULT '',
+            mfe_bars INTEGER DEFAULT 0
         );
         """)
         # Tự động nâng cấp bảng cũ nếu CSDL đã tạo từ phiên bản trước
@@ -271,6 +283,13 @@ def db_init():
             "ALTER TABLE signal_outcomes ADD COLUMN net_profit REAL DEFAULT 0",
             "ALTER TABLE signal_outcomes ADD COLUMN lesson_logged INTEGER DEFAULT 0",
             "ALTER TABLE signal_outcomes ADD COLUMN telegram_alerted INTEGER DEFAULT 0",
+            "ALTER TABLE signal_outcomes ADD COLUMN mfe REAL",
+            "ALTER TABLE signal_outcomes ADD COLUMN mae REAL",
+            "ALTER TABLE signal_outcomes ADD COLUMN mfe_r REAL",
+            "ALTER TABLE signal_outcomes ADD COLUMN mae_r REAL",
+            "ALTER TABLE signal_outcomes ADD COLUMN risk_dist REAL",
+            "ALTER TABLE signal_outcomes ADD COLUMN mfe_class TEXT DEFAULT ''",
+            "ALTER TABLE signal_outcomes ADD COLUMN mfe_bars INTEGER DEFAULT 0",
         ):
             try:
                 conn.execute(sql)
@@ -602,7 +621,7 @@ _BINANCE_HOSTS = ["https://api.binance.com", "https://api1.binance.com", "https:
 _BINANCE_FAST_HOST = {"host": None}
 
 
-def fetch_binance(asset, tf, limit=300):
+def fetch_binance(asset, tf, limit=1000):
     sym = ASSETS[asset]["binance"]
     hosts = list(_BINANCE_HOSTS)
     fast = _BINANCE_FAST_HOST.get("host")
@@ -736,6 +755,10 @@ def _save_mt5_cache_throttled(force=False):
         pass
 
 
+# EMA200 cần ~700 nến để giá trị khởi điểm hết ảnh hưởng: 300 nến lệch 0.07–0.16% (≈1 ATR M5).
+MT5_MAX_BARS = 1200
+
+
 def mt5_push(payload):
     """Nhận dữ liệu từ bridge: {"asset","symbol","tick":{bid,ask,last,change_pct,high24,low24,volume24},"tf","candles":[{t,o,h,l,c,v}]}"""
     asset = str(payload.get("asset", "")).upper()
@@ -769,7 +792,7 @@ def mt5_push(payload):
             else:
                 merged = {c["t"]: c for c in old["candles"]}              # gói vài nến cuối -> gộp vào
                 merged.update({c["t"]: c for c in clean})
-            rows = sorted(merged.values(), key=lambda x: x["t"])[-400:]
+            rows = sorted(merged.values(), key=lambda x: x["t"])[-MT5_MAX_BARS:]
             if len(rows) >= 30:
                 MT5_FEED[(asset, tf)] = {"ts": now, "candles": rows, "symbol": sym}
             else:
@@ -2204,6 +2227,12 @@ def db_set_outcome(signal_id, outcome, source, detail="", exit_reason="", close_
             conn.execute("UPDATE signal_outcomes SET telegram_alerted=0 WHERE signal_id=?", (sid,))
         conn.commit()
         conn.close()
+    SETUP_CACHE["ts"] = 0
+    if outcome in ("win", "loss"):
+        try:
+            update_outcome_mfe(sid)      # MFE/MAE trước khi ghi bài học để bài học có nhãn sai hướng / SL quá chặt
+        except Exception as e:
+            print("update_outcome_mfe error:", e)
     if trigger_hooks and outcome in ("win", "loss"):
         try:
             on_signal_outcome_recorded(sid)
@@ -2815,7 +2844,7 @@ def agent_scorecard(force=False):
         known = db_outcomes()
         sigs = executed_signals()
         stats = {aid: {"votes": 0, "correct": 0} for aid in VOTERS}
-        recent, pending, wins = [], 0, 0
+        recent, pending, wins, neutral = [], 0, 0, 0
         for s in sigs:
             oc = known.get(s["signal_id"])
             outcome = oc["outcome"] if oc else None
@@ -2825,6 +2854,7 @@ def agent_scorecard(force=False):
             close_price = oc.get("close_price", 0.0) if oc else 0.0
             close_time = oc.get("close_time", "") if oc else ""
             net_profit = oc.get("net_profit", 0.0) if oc else 0.0
+            mfe_class = (oc.get("mfe_class") or "") if oc else ""
             if not outcome:
                 try:
                     outcome, detail, full_oc = evaluate_by_candles(s)
@@ -2839,14 +2869,18 @@ def agent_scorecard(force=False):
                     db_set_outcome(s["signal_id"], outcome, source, detail,
                                    exit_reason=exit_reason, close_price=close_price,
                                    close_time=close_time, net_profit=net_profit)
+                    mfe_class = (db_outcome_row(s["signal_id"]) or {}).get("mfe_class") or ""
             recent.append({"signal_id": s["signal_id"], "asset": s["asset"], "action": s["action"], "ticket": s["ticket"],
                            "outcome": outcome or "pending", "exit_reason": exit_reason or ("OPEN" if not outcome else ""),
                            "close_price": close_price, "close_time": close_time, "net_profit": net_profit,
-                           "source": source, "detail": detail, "votes": s["votes"]})
+                           "source": source, "detail": detail, "votes": s["votes"], "mfe_class": mfe_class})
             if not outcome:
                 pending += 1
                 continue
             wins += outcome == "win"
+            if outcome == "loss" and mfe_class in ("stop_too_tight", "good"):
+                neutral += 1      # thua nhưng không sai hướng (MFE ≥ 0.3R): không trừ điểm agent nào
+                continue
             for aid in VOTERS:
                 v = s["votes"].get(aid)
                 if v not in ("BUY", "SELL"):
@@ -2868,7 +2902,8 @@ def agent_scorecard(force=False):
         data = {"generated_at": now_iso(), "auto_weight": auto, "min_votes": SCORE_MIN_VOTES,
                 "consensus_threshold": float(CONFIG.get("quant_consensus") or 0.4),
                 "signals": {"executed": len(sigs), "evaluated": done, "pending": pending, "wins": wins,
-                            "losses": done - wins, "win_rate": round(wins * 100.0 / done, 1) if done else None},
+                            "losses": done - wins, "win_rate": round(wins * 100.0 / done, 1) if done else None,
+                            "neutral_losses": neutral},
                 "agents": agents, "regime_multipliers": REGIME_MULT, "recent": recent[-30:][::-1]}
         SCORE_CACHE["ts"], SCORE_CACHE["data"] = time.time(), data
         return data
@@ -2880,6 +2915,437 @@ def agent_weight_factors():
     except Exception as e:
         print("scorecard:", e)
         return {}
+
+
+# ---- Vòng tự học: MFE/MAE, thống kê theo setup, chặn dồn lệnh & cooldown sau SL ----
+MFE_WRONG_R = 0.3          # MFE < 0.3R: đọc sai hướng
+MFE_TIGHT_R = 1.0          # đã chạy ≥ 1R rồi mới dính SL: SL quá chặt
+SETUP_MIN_SHOW = 8         # setup đủ mẫu để đưa vào prompt / bảng tốt-tệ
+SETUP_MIN_BLOCK = 15       # setup đủ mẫu để chặn khi kỳ vọng âm
+SETUP_CACHE = {"ts": 0, "rows": None}
+SETUP_LOCK = threading.Lock()
+MFE_BACKFILL = {"ts": 0}
+MFE_CLASS_VI = {"wrong_direction": "SAI HƯỚNG", "stop_too_tight": "SL QUÁ CHẶT", "good": "HƯỚNG ĐÚNG"}
+# Điều kiện "kèo được học": có lệnh khớp thật hoặc đã gửi Telegram (giống on_signal_outcome_recorded)
+LEARNED_SQL = """(s.telegram_sent = 1 OR EXISTS (SELECT 1 FROM executions e WHERE e.signal_id = s.id AND e.dry_run = 0
+                  AND e.ticket > 0 AND (e.error IS NULL OR e.error = '')))"""
+
+
+def db_outcome_row(signal_id):
+    with DB_LOCK:
+        conn = db_conn()
+        r = conn.execute("SELECT * FROM signal_outcomes WHERE signal_id=?", (int(signal_id),)).fetchone()
+        conn.close()
+    return dict(r) if r else None
+
+
+def local_ts_epoch(s):
+    """Chuỗi now_iso() (giờ máy chủ) -> epoch. Sai định dạng -> None."""
+    try:
+        return time.mktime(time.strptime(str(s or "")[:19], "%Y-%m-%d %H:%M:%S"))
+    except (ValueError, OverflowError):
+        return None
+
+
+def broker_ts_epoch(s, asset):
+    """Chuỗi giờ MT5 (giờ server broker, 'YYYY.MM.DD HH:MM[:SS]') -> epoch UTC. Chưa biết lệch giờ broker -> None."""
+    off = broker_utc_offset(asset)
+    if off is None:
+        return None
+    txt = str(s or "")[:19].replace(".", "-")
+    for f in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(txt, f).replace(tzinfo=timezone.utc).timestamp() - off * 3600
+        except ValueError:
+            continue
+    return None
+
+
+def outcome_close_epoch(oc, asset):
+    """Giờ đóng kèo (epoch). Deal MT5 mang giờ broker; dò nến ghi giờ máy chủ. Không đọc được -> giờ server ghi nhận kết quả."""
+    ct = oc.get("close_time") or ""
+    if ct:
+        t = local_ts_epoch(ct) if oc.get("source") == "candles" else broker_ts_epoch(ct, asset)
+        if t and t <= time.time() + 600:
+            return t
+    return local_ts_epoch(oc.get("evaluated_at"))
+
+
+def m5_candles_utc(asset):
+    """Nến MT5 M5 của tài sản với t đã quy về UTC. [] nếu chưa có nến MT5 hoặc chưa biết lệch giờ broker."""
+    with MT5_LOCK:
+        f = MT5_FEED.get((asset, "5m"))
+        candles = list(f["candles"]) if f else []
+    if not candles:
+        with MARKET_CACHE_LOCK:
+            mc = MARKET_CACHE.get((asset, "5m"))
+            if mc and mc.get("all") and str(mc["data"].get("source", "")).startswith("mt5:"):
+                candles = list(mc["all"])
+    if not candles:
+        return []
+    off = broker_utc_offset(asset)
+    if off is None:
+        return []
+    return [dict(c, t=c["t"] - off * 3600) for c in candles]
+
+
+def compute_mfe_mae(asset, action, entry, sl, start, end):
+    """Mức thuận tối đa (MFE) và ngược tối đa (MAE) từ nến M5 trong [giờ vào, giờ đóng], theo giá và theo R = |entry - SL|."""
+    risk = abs(float(entry or 0) - float(sl or 0))
+    if action not in ("BUY", "SELL") or not entry or risk <= 0 or not start or not end or end < start:
+        return None
+    cs = m5_candles_utc(asset)
+    if not cs or cs[0]["t"] > start or cs[-1]["t"] + 300 + 600 < end:
+        return None                     # nến không phủ trọn khoảng giữ lệnh
+    win = [c for c in cs if c["t"] + 300 > start and c["t"] <= end]
+    if not win:
+        return None
+    hi = max(c["h"] for c in win)
+    lo = min(c["l"] for c in win)
+    if action == "BUY":
+        mfe, mae = hi - entry, entry - lo
+    else:
+        mfe, mae = entry - lo, hi - entry
+    mfe, mae = max(0.0, mfe), max(0.0, mae)
+    d = ASSETS.get(asset, {}).get("decimals", 2)
+    return {"mfe": round(mfe, d), "mae": round(mae, d), "mfe_r": round(mfe / risk, 3), "mae_r": round(mae / risk, 3),
+            "risk_dist": round(risk, d), "bars": len(win)}
+
+
+def classify_mfe(outcome, exit_reason, mfe_r):
+    if mfe_r is None:
+        return ""
+    if mfe_r < MFE_WRONG_R:
+        return "wrong_direction"
+    rsn = str(exit_reason or "").upper()
+    if outcome == "loss" and mfe_r >= MFE_TIGHT_R and ("SL" in rsn or not rsn):
+        return "stop_too_tight"
+    return "good"
+
+
+def _real_execs(conn, signal_id):
+    return [dict(x) for x in conn.execute("""SELECT * FROM executions WHERE signal_id=? AND dry_run=0 AND ticket>0
+            AND (error IS NULL OR error='') ORDER BY id ASC""", (int(signal_id),)).fetchall()]
+
+
+def update_outcome_mfe(signal_id):
+    """Tính & lưu MFE/MAE + nhãn cho 1 kèo đã có kết quả win/loss. Trả dict kết quả hoặc None (thiếu nến/thông tin)."""
+    sid = int(signal_id)
+    with DB_LOCK:
+        conn = db_conn()
+        oc = conn.execute("SELECT * FROM signal_outcomes WHERE signal_id=?", (sid,)).fetchone()
+        s = conn.execute("SELECT id, asset, action, entry, stop_loss, created_at FROM signals WHERE id=?", (sid,)).fetchone()
+        exs = _real_execs(conn, sid) if s else []
+        conn.close()
+    if not oc or not s or oc["outcome"] not in ("win", "loss") or s["action"] not in ("BUY", "SELL"):
+        return None
+    oc = dict(oc)
+    ex = exs[0] if exs else None
+    entry = float(ex["price"] or 0) if ex and ex["price"] else float(s["entry"] or 0)
+    sl = float(ex["sl"] or 0) if ex and ex["sl"] else float(s["stop_loss"] or 0)
+    start = local_ts_epoch(ex["created_at"] if ex else s["created_at"])
+    end = outcome_close_epoch(oc, s["asset"])
+    res = compute_mfe_mae(s["asset"], s["action"], entry, sl, start, end)
+    if not res:
+        return None
+    res["mfe_class"] = classify_mfe(oc["outcome"], oc.get("exit_reason"), res["mfe_r"])
+    with DB_LOCK:
+        conn = db_conn()
+        conn.execute("""UPDATE signal_outcomes SET mfe=?, mae=?, mfe_r=?, mae_r=?, risk_dist=?, mfe_class=?, mfe_bars=?
+                        WHERE signal_id=?""", (res["mfe"], res["mae"], res["mfe_r"], res["mae_r"], res["risk_dist"],
+                                               res["mfe_class"], res["bars"], sid))
+        conn.commit()
+        conn.close()
+    SETUP_CACHE["ts"] = 0
+    SCORE_CACHE["ts"] = 0
+    return res
+
+
+def backfill_mfe(limit=40, min_gap=120):
+    """Bổ sung MFE/MAE cho kèo đã có kết quả nhưng lúc đóng chưa đủ nến (vd server vừa restart). Tối đa 1 lần / min_gap giây."""
+    if time.time() - MFE_BACKFILL["ts"] < min_gap:
+        return 0
+    MFE_BACKFILL["ts"] = time.time()
+    with DB_LOCK:
+        conn = db_conn()
+        rows = conn.execute("""SELECT o.signal_id FROM signal_outcomes o JOIN signals s ON s.id = o.signal_id
+            WHERE o.outcome IN ('win','loss') AND o.mfe_r IS NULL AND s.action IN ('BUY','SELL') AND %s
+            ORDER BY o.signal_id DESC LIMIT ?""" % LEARNED_SQL, (int(limit),)).fetchall()
+        conn.close()
+    n = 0
+    for r in rows:
+        try:
+            n += update_outcome_mfe(r["signal_id"]) is not None
+        except Exception as e:
+            print("backfill_mfe:", e)
+    return n
+
+
+def setup_session(epoch):
+    """Phiên theo giờ UTC: Á (21h–7h), London (7h–12h), NY (12h–21h, gồm giờ giao London + NY)."""
+    h = datetime.fromtimestamp(epoch or time.time(), timezone.utc).hour
+    return "Á" if h < 7 or h >= 21 else ("London" if h < 12 else "NY")
+
+
+def setup_key(asset, action, regime, structure, vwap_zone, session):
+    return (asset, action, str(regime or "?"), str(structure or "?"), str(vwap_zone or "?"), session)
+
+
+def setup_label(k, with_asset=False):
+    return "%s%s | %s | %s | %s | %s" % (k[0] + " " if with_asset else "", k[1], k[2], k[3], k[4], k[5])
+
+
+def trade_r_multiple(sig, oc, exs):
+    """Kết quả kèo theo R. Có lệnh thật đã đóng: TB theo lot của (giá đóng - giá vào)/|giá vào - SL gốc|.
+    Chỉ có kết quả dò nến: quy theo nhãn (EA chia đôi TP1/TP2, phần TP2 dời BE khi TP1 chạm)."""
+    sign = 1.0 if sig["action"] == "BUY" else -1.0
+    closed = [e for e in exs if e.get("status") == "closed" and e.get("price") and e.get("sl") and e.get("close_price")
+              and abs(float(e["price"]) - float(e["sl"])) > 0]
+    if closed:
+        num = den = 0.0
+        for e in closed:
+            w = float(e.get("volume") or 0) or 1.0
+            num += w * sign * (float(e["close_price"]) - float(e["price"])) / abs(float(e["price"]) - float(e["sl"]))
+            den += w
+        return num / den
+    rr1 = float(sig.get("rr1") or 1.8)
+    rr2 = float(sig.get("rr2") or 2.6)
+    lbl = str(oc.get("exit_reason") or "").upper()
+    if "TP1+TP2" in lbl or lbl == "TP2":
+        return (rr1 + rr2) / 2.0
+    if lbl.startswith("TP1"):
+        return rr1 / 2.0                     # TP1 chạm, phần còn lại tính hoà vốn (thận trọng)
+    if lbl == "TP":
+        return rr1
+    if "SL" in lbl:
+        return -1.0
+    if lbl == "BE":
+        return 0.0
+    entry, stop, cp = float(sig.get("entry") or 0), float(sig.get("stop_loss") or 0), float(oc.get("close_price") or 0)
+    if entry > 0 and cp > 0 and abs(entry - stop) > 0:
+        return sign * (cp - entry) / abs(entry - stop)
+    return 1.0 if oc.get("outcome") == "win" else -1.0
+
+
+def learned_trades(asset=None, limit=2000):
+    """Các kèo đã có kết quả win/loss thuộc diện được học, kèm khoá setup và R. Mới nhất trước."""
+    q = """SELECT s.id, s.asset, s.action, s.entry, s.stop_loss, s.rr1, s.rr2, s.confidence, s.created_at, s.indicators_json,
+               o.outcome, o.exit_reason, o.close_price, o.close_time, o.net_profit, o.source, o.evaluated_at,
+               o.mfe, o.mae, o.mfe_r, o.mae_r, o.mfe_class
+        FROM signal_outcomes o JOIN signals s ON s.id = o.signal_id
+        WHERE o.outcome IN ('win','loss') AND s.action IN ('BUY','SELL') AND %s%s
+        ORDER BY s.id DESC LIMIT ?""" % (LEARNED_SQL, " AND s.asset=?" if asset else "")
+    with DB_LOCK:
+        conn = db_conn()
+        rows = [dict(r) for r in conn.execute(q, ((asset, int(limit)) if asset else (int(limit),))).fetchall()]
+        ex_map = {}
+        if rows:
+            ids = [r["id"] for r in rows]
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                for e in conn.execute("""SELECT * FROM executions WHERE dry_run=0 AND ticket>0 AND (error IS NULL OR error='')
+                        AND signal_id IN (%s) ORDER BY id ASC""" % ",".join("?" for _ in chunk), chunk).fetchall():
+                    ex_map.setdefault(e["signal_id"], []).append(dict(e))
+        conn.close()
+    out = []
+    for r in rows:
+        try:
+            ind = json.loads(r.pop("indicators_json") or "{}")
+        except Exception:
+            ind = {}
+        reg = ((ind.get("ta") or {}).get("regime") or {}).get("regime")
+        ts = local_ts_epoch(r["created_at"])
+        r["setup"] = setup_key(r["asset"], r["action"], reg, ind.get("structure"), ind.get("vwap_zone"), setup_session(ts))
+        r["r"] = round(trade_r_multiple(r, r, ex_map.get(r["id"], [])), 3)
+        out.append(r)
+    return out
+
+
+def setup_stats(asset=None, min_trades=1, force=False):
+    """Thống kê theo setup = (tài sản, chiều, trạng thái, cấu trúc, vùng VWAP, phiên): số lệnh, tỷ lệ thắng, kỳ vọng R."""
+    with SETUP_LOCK:
+        if force or SETUP_CACHE["rows"] is None or time.time() - SETUP_CACHE["ts"] > 60:
+            groups = {}
+            for t in learned_trades():
+                g = groups.setdefault(t["setup"], {"n": 0, "wins": 0, "sum_r": 0.0, "last_id": 0, "last_at": ""})
+                g["n"] += 1
+                g["wins"] += t["outcome"] == "win"
+                g["sum_r"] += t["r"]
+                if t["id"] > g["last_id"]:
+                    g["last_id"], g["last_at"] = t["id"], t["created_at"]
+            rows = []
+            for k, g in groups.items():
+                rows.append({"key": list(k), "asset": k[0], "action": k[1], "regime": k[2], "structure": k[3], "vwap_zone": k[4],
+                             "session": k[5], "label": setup_label(k), "n": g["n"], "wins": g["wins"], "losses": g["n"] - g["wins"],
+                             "win_rate": round(g["wins"] * 100.0 / g["n"], 1), "exp_r": round(g["sum_r"] / g["n"], 3),
+                             "sum_r": round(g["sum_r"], 2), "last_id": g["last_id"], "last_at": g["last_at"],
+                             "blocking": g["n"] >= SETUP_MIN_BLOCK and g["sum_r"] / g["n"] < 0})
+            rows.sort(key=lambda x: (-x["n"], -x["exp_r"]))
+            SETUP_CACHE["rows"], SETUP_CACHE["ts"] = rows, time.time()
+        rows = SETUP_CACHE["rows"]
+    return [r for r in rows if (not asset or r["asset"] == asset) and r["n"] >= min_trades]
+
+
+def setup_lookup(key):
+    for r in setup_stats():
+        if tuple(r["key"]) == tuple(key):
+            return r
+    return None
+
+
+def best_worst_setups(asset, k=5):
+    """Tốt = kỳ vọng dương (cao nhất trước), tệ = kỳ vọng ≤ 0 (thấp nhất trước): ít setup cũng không lẫn hai nhóm."""
+    rows = setup_stats(asset, min_trades=SETUP_MIN_SHOW)
+    best = sorted((r for r in rows if r["exp_r"] > 0), key=lambda x: -x["exp_r"])[:k]
+    worst = sorted((r for r in rows if r["exp_r"] <= 0), key=lambda x: x["exp_r"])[:k]
+    return best, worst
+
+
+def setup_prompt_block(asset, regime, structure, vwap_zone, session):
+    """Bảng 5 setup tốt nhất / 5 tệ nhất (≥ 8 lệnh) + thống kê 2 chiều của setup hiện tại, thay cho 5 bài học văn bản."""
+    best, worst = best_worst_setups(asset)
+    fmt_row = lambda r: "  • %s: %d lệnh, thắng %.0f%%, kỳ vọng %+.2fR" % (r["label"], r["n"], r["win_rate"], r["exp_r"])
+    lines = ["- Khoá setup = chiều | trạng thái | cấu trúc | vùng VWAP | phiên (Á/London/NY). Chỉ tính setup ≥ %d lệnh đã đóng." % SETUP_MIN_SHOW]
+    if best or worst:
+        lines.append("- 5 setup TỐT nhất (kỳ vọng dương):")
+        lines += [fmt_row(r) for r in best] or ["  • (chưa có)"]
+        lines.append("- 5 setup TỆ nhất (kỳ vọng âm hoặc 0):")
+        lines += [fmt_row(r) for r in worst] or ["  • (chưa có)"]
+    else:
+        lines.append("- Chưa có setup nào đủ %d lệnh đã đóng." % SETUP_MIN_SHOW)
+    for act in ("BUY", "SELL"):
+        key = setup_key(asset, act, regime, structure, vwap_zone, session)
+        r = setup_lookup(key)
+        if r:
+            lines.append("- Setup hiện tại nếu %s (%s): %d lệnh, thắng %.0f%%, kỳ vọng %+.2fR%s" % (
+                act, setup_label(key), r["n"], r["win_rate"], r["exp_r"],
+                " ⛔ SẼ BỊ CHẶN (≥ %d lệnh, kỳ vọng âm)" % SETUP_MIN_BLOCK if r["blocking"] and CONFIG.get("block_negative_setups", True) else
+                ("" if r["n"] >= SETUP_MIN_SHOW else " (chưa đủ mẫu)")))
+        else:
+            lines.append("- Setup hiện tại nếu %s (%s): chưa có lệnh nào." % (act, setup_label(key)))
+    return "\n".join(lines)
+
+
+def open_same_dir(asset, action):
+    """Kèo thật đang mở cùng tài sản cùng chiều (gộp 2 lệnh TP1/TP2 của 1 kèo) + kèo BUY/SELL vừa phát mà EA chưa phản hồi."""
+    sym = CONFIG.get("ea_gold_symbol") if asset == "XAUUSD" else CONFIG.get("ea_btc_symbol")
+    max_age = int(CONFIG.get("ea_max_signal_age_sec") or 300)
+    min_conf = int(CONFIG.get("ea_min_confidence") or 0)
+    with DB_LOCK:
+        conn = db_conn()
+        rows = conn.execute("""SELECT e.signal_id, e.ticket FROM executions e LEFT JOIN signals s ON s.id = e.signal_id
+            WHERE e.dry_run = 0 AND e.ticket > 0 AND (e.error IS NULL OR e.error = '') AND e.status = 'open'
+              AND (s.asset = ? OR (s.id IS NULL AND e.symbol = ?))
+              AND UPPER(COALESCE(NULLIF(e.action, ''), s.action)) = ?""", (asset, sym or "", action)).fetchall()
+        fresh = conn.execute("""SELECT s.id, s.created_at FROM signals s WHERE s.asset = ? AND s.action = ? AND s.confidence >= ?
+              AND NOT EXISTS (SELECT 1 FROM executions e WHERE e.signal_id = s.id)
+            ORDER BY s.id DESC LIMIT 5""", (asset, action, min_conf)).fetchall()
+        conn.close()
+    groups = {}
+    for r in rows:
+        groups.setdefault(r["signal_id"] or -r["ticket"], []).append(r["ticket"])
+    now = time.time()
+    pending = [r["id"] for r in fresh if (local_ts_epoch(r["created_at"]) or 0) > now - max_age]
+    return {"signals": sorted(k for k in groups if k > 0), "positions": sum(len(v) for v in groups.values()),
+            "count": len(groups) + len(pending), "pending": pending}
+
+
+def last_loss_same_dir(asset, action, within_sec):
+    """Kèo cùng tài sản cùng chiều đóng lỗ gần nhất trong within_sec giây (thuộc diện được học): (signal_id, epoch đóng) hoặc (None, None).
+    Lọc theo evaluated_at (luôn ≥ giờ đóng) chứ không theo id: kèo id nhỏ giữ lâu vẫn có thể là kèo đóng sau cùng."""
+    since = datetime.fromtimestamp(time.time() - within_sec - 6 * 3600).strftime("%Y-%m-%d %H:%M:%S")
+    with DB_LOCK:
+        conn = db_conn()
+        rows = [dict(r) for r in conn.execute("""SELECT o.*, s.id AS sid FROM signal_outcomes o JOIN signals s ON s.id = o.signal_id
+            WHERE s.asset = ? AND s.action = ? AND o.outcome = 'loss' AND o.evaluated_at >= ? AND %s
+            ORDER BY o.evaluated_at DESC LIMIT 200""" % LEARNED_SQL, (asset, action, since)).fetchall()]
+        conn.close()
+    best = (None, None)
+    for r in rows:
+        t = outcome_close_epoch(r, asset)
+        if t and (best[1] is None or t > best[1]):
+            best = (r["sid"], t)
+    return best
+
+
+def guard_state(asset, action, now=None):
+    """Trạng thái chặn dồn lệnh & cooldown của 1 chiều. Trả dict có "reasons" (rỗng = cho phép)."""
+    now = now or time.time()
+    lim = int(CONFIG.get("max_same_dir_open", 1) or 0)
+    cd_min = int(CONFIG.get("cooldown_after_sl_min", 45) or 0)
+    op = open_same_dir(asset, action)
+    sid, t_loss = last_loss_same_dir(asset, action, max(cd_min * 60, 86400))
+    cd_left = max(0.0, t_loss + cd_min * 60 - now) if (t_loss and cd_min > 0) else 0.0
+    reasons = []
+    if lim > 0 and op["count"] >= lim:
+        parts = []
+        if op["signals"]:
+            parts.append("kèo %s, %d lệnh MT5" % (", ".join("#%d" % i for i in op["signals"]), op["positions"]))
+        elif op["positions"]:
+            parts.append("%d lệnh MT5" % op["positions"])
+        if op["pending"]:
+            parts.append("kèo %s vừa phát chờ EA" % ", ".join("#%d" % i for i in op["pending"]))
+        reasons.append("Chặn dồn lệnh: đang có %d kèo %s %s mở (%s), giới hạn %d" % (
+            op["count"], action, asset, "; ".join(parts), lim))
+    if cd_left > 0:
+        reasons.append("Cooldown sau SL: kèo #%d %s %s đóng lỗ lúc %s, còn %d phút (cooldown %d phút)" % (
+            sid, action, asset, datetime.fromtimestamp(t_loss).strftime("%H:%M"), int(math.ceil(cd_left / 60.0)), cd_min))
+    return {"asset": asset, "action": action, "open": op["count"], "open_signals": op["signals"], "positions": op["positions"],
+            "pending": op["pending"], "limit": lim, "cooldown_min": cd_min, "cooldown_left_sec": int(cd_left),
+            "last_loss_signal": sid, "last_loss_at": datetime.fromtimestamp(t_loss).strftime("%Y-%m-%d %H:%M:%S") if t_loss else "",
+            "reasons": reasons}
+
+
+def learning_guards(asset, action, ind, ta):
+    """Lý do tự học bắt buộc WAIT: dồn lệnh cùng chiều, cooldown sau SL, setup kỳ vọng âm đủ mẫu."""
+    if action not in ("BUY", "SELL"):
+        return []
+    reasons = list(guard_state(asset, action)["reasons"])
+    if CONFIG.get("block_negative_setups", True):
+        key = setup_key(asset, action, ((ta or {}).get("regime") or {}).get("regime"), ind.get("structure"),
+                        ind.get("vwap_zone"), setup_session(time.time()))
+        r = setup_lookup(key)
+        if r and r["blocking"]:
+            reasons.append("Setup âm: %s có %d lệnh, thắng %.0f%%, kỳ vọng %+.2fR < 0" % (
+                setup_label(key, True), r["n"], r["win_rate"], r["exp_r"]))
+    return reasons
+
+
+def enforce_learning_guards(decision, asset, ind, ta):
+    reasons = learning_guards(asset, decision.get("action"), ind, ta)
+    if not reasons:
+        return decision
+    d = dict(decision)
+    d["summary"] = "%s ⛔ Tự học ép WAIT (đề xuất gốc %s %d%%): %s." % (
+        d.get("summary", ""), d["action"], int(d.get("confidence") or 0), " | ".join(reasons))
+    d["action"] = "WAIT"
+    d["confidence"] = min(int(d.get("confidence") or 50), 60)
+    d["learn_guards"] = reasons
+    return d
+
+
+def learning_report():
+    """Dữ liệu tab Tự học: bảng setup, phân loại MFE/MAE 30 lệnh gần nhất, trạng thái chặn dồn lệnh / cooldown."""
+    try:
+        backfill_mfe()
+    except Exception as e:
+        print("backfill_mfe:", e)
+    recent = learned_trades(limit=30)
+    counts = {"wrong_direction": 0, "stop_too_tight": 0, "good": 0, "unknown": 0}
+    for t in recent:
+        counts[t["mfe_class"] if t.get("mfe_class") in counts else "unknown"] += 1
+    measured = len(recent) - counts["unknown"]
+    pct = {k: (round(counts[k] * 100.0 / measured, 1) if measured else None) for k in ("wrong_direction", "stop_too_tight", "good")}
+    guards = [guard_state(a, act) for a in ASSETS for act in ("BUY", "SELL")]
+    return {"generated_at": now_iso(),
+            "config": {k: CONFIG.get(k, DEFAULT_CONFIG[k]) for k in ("max_same_dir_open", "cooldown_after_sl_min", "block_negative_setups")},
+            "thresholds": {"wrong_r": MFE_WRONG_R, "tight_r": MFE_TIGHT_R, "min_show": SETUP_MIN_SHOW, "min_block": SETUP_MIN_BLOCK},
+            "guards": guards, "setups": setup_stats(force=True),
+            "mfe": {"total": len(recent), "measured": measured, "counts": counts, "pct": pct,
+                    "rows": [{"signal_id": t["id"], "asset": t["asset"], "action": t["action"], "outcome": t["outcome"],
+                              "exit_reason": t["exit_reason"], "r": t["r"], "mfe": t["mfe"], "mae": t["mae"], "mfe_r": t["mfe_r"],
+                              "mae_r": t["mae_r"], "mfe_class": t["mfe_class"] or "", "setup": setup_label(t["setup"]),
+                              "created_at": t["created_at"]} for t in recent]}}
 
 
 # ============================================================================
@@ -3248,7 +3714,7 @@ def ta_prompt_block(asset, ta, votes):
     return "\n".join(lines)
 
 
-def build_prompt(asset, tf, ind, ticker, votes, news, skill_text, ta=None):
+def build_prompt(asset, tf, ind, ticker, votes, news, skill_text, ta=None, setup_text=None):
     ta = ta or {}
     mem = ta.get("memory") or sl_tp_memory_block(asset)
     news_txt = "\n".join("- %s%s (%s, %s)" % ("🔥 " if n.get("relevant") else "", n["title"], n.get("source", ""), n.get("published", ""))
@@ -3273,16 +3739,19 @@ def build_prompt(asset, tf, ind, ticker, votes, news, skill_text, ta=None):
 ## HỒ SƠ THỰC CHIẾN & LỊCH SỬ CHẠM SL/TP GẦN NHẤT (BỘ NÃO TỰ HỌC)
 %s
 
+## THỐNG KÊ THEO SETUP (kỳ vọng R = lãi/lỗ trung bình mỗi lệnh tính theo khoảng SL; tránh setup kỳ vọng âm)
+%s
+
 ## TIN VĨ MÔ MỚI NHẤT (tin bắt đầu bằng "Telegram:" là từ kênh tin realtime, 🔥 = liên quan trực tiếp; hãy cân nhắc tác động tới kèo)
 %s
 
-## QUY TẮC KỶ LUẬT & BÀI HỌC HẬU KIỂM (trích SKILL.md)
+## QUY TẮC KỶ LUẬT (trích SKILL.md)
 %s
 
 ## YÊU CẦU
 Trả về DUY NHẤT một JSON (tiếng Việt), không thêm chữ nào khác:
 {"action": "BUY|SELL|WAIT", "confidence": 50-95, "bull_argument": "lập luận phe mua 2-3 câu (nêu rõ cấu trúc, VWAP và Volume/VSA)", "bear_argument": "lập luận phe bán 2-3 câu (nêu rõ rủi ro, kháng cự và áp lực Volume)", "summary": "kết luận trưởng nhóm 2-4 câu có số liệu giá, RVOL và rút kinh nghiệm từ lịch sử SL/TP", "lesson_learned": "1 bài học kỷ luật ngắn gọn rút ra từ kèo này"}
-Chỉ chọn BUY/SELL khi điểm đồng thuận có trọng số đạt ngưỡng, có sự ủng hộ của dòng tiền Volume (tránh phá vỡ giả khi RVOL thấp) và không lặp lại sai lầm của các lệnh vừa dính SL gần đây. Nếu mâu thuẫn, chọn WAIT.
+Chỉ chọn BUY/SELL khi điểm đồng thuận có trọng số đạt ngưỡng, có sự ủng hộ của dòng tiền Volume (tránh phá vỡ giả khi RVOL thấp), setup hiện tại không có kỳ vọng âm và không lặp lại sai lầm của các lệnh vừa dính SL gần đây. Nếu mâu thuẫn, chọn WAIT.
 Bắt buộc WAIT khi kèo bị veto khung lớn, có cờ chặn biến động/spread, hoặc bị Cá Voi Volume cảnh báo Fakeout cạn thanh khoản.""" % (
         ASSETS[asset]["label"], tf, ind["price"], ticker["change_pct"], ticker["high24"], ticker["low24"],
         ind["vwap"], ind["vwap_upper"], ind["vwap_lower"], ind["vwap_zone"],
@@ -3292,7 +3761,7 @@ Bắt buộc WAIT khi kèo bị veto khung lớn, có cờ chặn biến động
         float(ind.get("vol_ratio") or 1.0), float(ind.get("vol_ratio_3") or 1.0),
         float(ind.get("vol_delta_ratio") or 0.0) * 100, ind.get("vsa_signal", "NORMAL"),
         ta_prompt_block(asset, ta, votes) or "- (không có)",
-        len(votes), votes_txt, mem.get("text", "- (chưa có)"),
+        len(votes), votes_txt, mem.get("text", "- (chưa có)"), setup_text or "- (chưa có)",
         news_txt or "- (không có)", skill_text[:2800])
 
 
@@ -3320,15 +3789,17 @@ def read_skill(asset):
         return "# (Chưa có SKILL.md cho %s)" % asset
 
 
-def skill_rules_excerpt(text):
-    """Lấy phần quy tắc (trước mục Nhật ký) + ưu tiên các bài học [HẬU KIỂM THỰC CHIẾN] từ SL/TP + các bài học gần nhất."""
+def skill_rules_excerpt(text, post_mortems=5):
+    """Lấy phần quy tắc (trước mục Nhật ký) + tối đa post_mortems bài học [HẬU KIỂM THỰC CHIẾN] + các bài học gần nhất.
+    Phiên họp truyền post_mortems=0: kinh nghiệm thực chiến đã nằm trong bảng thống kê setup."""
     if JOURNAL_HEADER in text:
         rules, journal = text.split(JOURNAL_HEADER, 1)
         all_lines = [l for l in journal.strip().splitlines() if l.strip().startswith("-")]
-        post_mortems = [l for l in all_lines if "[HẬU KIỂM" in l][-5:]
+        pms = [l for l in all_lines if "[HẬU KIỂM" in l][-post_mortems:] if post_mortems > 0 else []
         recent_regular = [l for l in all_lines if "[HẬU KIỂM" not in l][-4:]
-        combined = post_mortems + [l for l in recent_regular if l not in post_mortems]
-        return rules.strip() + "\n\n" + JOURNAL_HEADER + " (Ưu tiên bài học hậu kiểm chạm SL/TP)\n" + "\n".join(combined[-8:])
+        combined = pms + [l for l in recent_regular if l not in pms]
+        title = " (Ưu tiên bài học hậu kiểm chạm SL/TP)" if pms else " (bài học gần nhất)"
+        return rules.strip() + "\n\n" + JOURNAL_HEADER + title + "\n" + "\n".join(combined[-8:])
     return text
 
 
@@ -3358,12 +3829,15 @@ def append_outcome_lesson(sig, oc):
     rsn = oc.get("exit_reason") or ("TP" if outcome == "win" else "SL")
     ind = sig.get("indicators") or {}
     votes = sig.get("votes") or {}
+    cls = oc.get("mfe_class") or ""
+    # Thua nhưng không sai hướng (SL quá chặt / thua thường): agent cùng chiều kèo không bị coi là sai
+    dir_ok = outcome == "win" or cls in ("stop_too_tight", "good")
     right_ag, wrong_ag = [], []
     for aid, v_raw in votes.items():
         v = v_raw[0] if isinstance(v_raw, (list, tuple)) else v_raw
         if v not in ("BUY", "SELL"):
             continue
-        is_right = (v == sig.get("action")) == (outcome == "win")
+        is_right = (v == sig.get("action")) == dir_ok
         (right_ag if is_right else wrong_ag).append("%s(%s)" % (VOTE_LABELS.get(aid, aid), v))
     vr = float(ind.get("vol_ratio") or 1.0)
     vsa = str(ind.get("vsa_signal") or "NORMAL")
@@ -3371,9 +3845,20 @@ def append_outcome_lesson(sig, oc):
     vzone = str(ind.get("vwap_zone") or "?")
     net = float(oc.get("net_profit") or 0.0)
     pnl_str = " (%+.2f USD)" % net if net != 0 else ""
-    if outcome == "loss":
-        advice = ("RÚT KINH NGHIỆM THUA (SL): Tránh vào %s khi cấu trúc %s / vùng %s (RVOL %.2f×, VSA=%s). "
+    mfe_txt = ""
+    if oc.get("mfe_r") is not None:
+        mfe_txt = " · MFE %+.2fR / MAE -%.2fR → %s" % (float(oc["mfe_r"]), float(oc.get("mae_r") or 0), MFE_CLASS_VI.get(cls, cls))
+    if outcome == "loss" and cls == "stop_too_tight":
+        advice = ("THUA DO SL QUÁ CHẶT: hướng %s đúng (giá đã chạy %.2fR) nhưng quay lại quét SL. Với cấu trúc %s / vùng %s "
+                  "(RVOL %.2f×, VSA=%s) cần SL rộng hơn hoặc dời hoà vốn/chốt một phần sớm hơn, KHÔNG đảo chiều." % (
+                      sig.get("action"), float(oc.get("mfe_r") or 0), struct, vzone, vr, vsa))
+    elif outcome == "loss" and cls == "good":
+        advice = ("THUA THƯỜNG (hướng không sai, MFE %.2fR): giữ kỷ luật SL, chưa đủ cơ sở đổi luật cho setup %s / %s / %s." % (
+            float(oc.get("mfe_r") or 0), sig.get("action"), struct, vzone))
+    elif outcome == "loss":
+        advice = ("RÚT KINH NGHIỆM THUA (SL%s): Tránh vào %s khi cấu trúc %s / vùng %s (RVOL %.2f×, VSA=%s). "
                   "Cần lưu ý phản biện của %s." % (
+                      ", SAI HƯỚNG" if cls == "wrong_direction" else "",
                       sig.get("action"), struct, vzone, vr, vsa,
                       ", ".join(right_ag) if right_ag else "các chỉ báo ngược chiều"))
     else:
@@ -3381,9 +3866,9 @@ def append_outcome_lesson(sig, oc):
                   "đồng thuận bởi %s." % (
                       rsn, sig.get("action"), struct, vzone, vr, vsa,
                       ", ".join(right_ag) if right_ag else "nhóm chuyên viên"))
-    lesson_txt = ("[HẬU KIỂM THỰC CHIẾN Kèo #%s · Chạm %s @%s%s] Đúng: %s | Sai: %s → %s" % (
+    lesson_txt = ("[HẬU KIỂM THỰC CHIẾN Kèo #%s · Chạm %s @%s%s%s] Đúng: %s | Sai: %s → %s" % (
         sig.get("id"), rsn, "{:g}".format(float(oc.get("close_price") or sig.get("entry") or 0)),
-        pnl_str, ", ".join(right_ag) or "—", ", ".join(wrong_ag) or "—", advice))
+        pnl_str, mfe_txt, ", ".join(right_ag) or "—", ", ".join(wrong_ag) or "—", advice))
     return append_lesson(asset, lesson_txt, sig.get("action", "WAIT"), int(sig.get("confidence") or 50))
 
 
@@ -4208,6 +4693,12 @@ def run_meeting(asset):
         except Exception:
             pass
         mem_info = sl_tp_memory_block(asset)
+        try:
+            setup_text = setup_prompt_block(asset, reg_info.get("regime"), ind.get("structure"), ind.get("vwap_zone"),
+                                            setup_session(time.time()))
+        except Exception as e:
+            traceback.print_exc()
+            setup_text = "- (lỗi thống kê setup: %s)" % str(e)[:120]
         ta = {"htf": htf_info, "regime": reg_info, "levels": lv_info, "volume": vol_info, "memory": mem_info}
         ta["consensus"] = consensus(votes, reg_info.get("regime"), loss_streak=int(mem_info.get("loss_streak") or 0))
         extra = {"htf_scout": " · veto %s" % htf_info["veto"] if htf_info.get("veto") else "",
@@ -4225,7 +4716,7 @@ def run_meeting(asset):
         set_step(3, "Bước 3/5 · Hermes nạp SKILL.md & Hồ sơ tự học SL/TP")
         set_agent("hermes_scribe", status="working", bubble="Đọc %s & lịch sử SL/TP..." % SKILL_FILES[asset], tasks=1)
         skill_full = read_skill(asset)
-        skill_text = skill_rules_excerpt(skill_full)
+        skill_text = skill_rules_excerpt(skill_full, post_mortems=0)   # bài học hậu kiểm dạng chữ -> thay bằng bảng setup
         log("hermes_scribe", "📚 Nạp %s (%d ký tự) + Bộ nhớ thực chiến (%d Thắng / %d Thua)." % (
             SKILL_FILES[asset], len(skill_full), mem_info.get("wins", 0), mem_info.get("losses", 0)))
         pause(STEP_DELAY * 0.7)
@@ -4241,7 +4732,7 @@ def run_meeting(asset):
             set_agent(aid, bubble="Tôi bầu %s%s" % (v, extra.get(aid, "")))
         set_agent("macro_owl", bubble="Tin: %s" % news[0]["title"][:40])
         set_agent("hermes_scribe", bubble="Kiểm tra kỷ luật & SL/TP...")
-        prompt = build_prompt(asset, tf, ind, tk, votes, news, skill_text, ta)
+        prompt = build_prompt(asset, tf, ind, tk, votes, news, skill_text, ta, setup_text)
         decision, provider, errors = call_free_llm(prompt, cfg)
         for e in errors:
             log("chief_strategist", "⚠️ LLM lỗi: %s" % e, room="meeting_room")
@@ -4255,6 +4746,17 @@ def run_meeting(asset):
             log("chief_strategist", "⛔ Ép WAIT: %s" % " | ".join(decision["guards"]), room="meeting_room")
             guard_agent = "htf_scout" if (ta["htf"] or {}).get("veto") else ("volume_whale" if (ta.get("volume") or {}).get("fakeout_warning") else "regime_meter")
             set_agent(guard_agent, bubble="⛔ Không vào lệnh!")
+        try:
+            decision = enforce_learning_guards(decision, asset, ind, ta)
+        except Exception as e:
+            traceback.print_exc()       # lỗi kiểm tra thì không mạo hiểm dồn lệnh: hạ WAIT
+            if decision.get("action") in ("BUY", "SELL"):
+                decision = dict(decision, action="WAIT", confidence=min(int(decision.get("confidence") or 50), 60),
+                                learn_guards=["Lỗi kiểm tra chặn dồn lệnh/cooldown (%s)" % str(e)[:100]])
+                decision["summary"] = "%s ⛔ Tự học ép WAIT: %s." % (decision.get("summary", ""), decision["learn_guards"][0])
+        if decision.get("learn_guards"):
+            log("risk_guard", "⛔ Tự học ép WAIT: %s" % " | ".join(decision["learn_guards"]), room="meeting_room")
+            set_agent("risk_guard", bubble="⛔ Không dồn lệnh / đang cooldown!")
         pause()
         log("chief_strategist", "🟢 Phe Mua: %s" % decision["bull_argument"], room="meeting_room")
         log("chief_strategist", "🔴 Phe Bán: %s" % decision["bear_argument"], room="meeting_room")
@@ -4644,6 +5146,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/agents/scorecard":
                 return self.send_json(agent_scorecard(force=(qs.get("refresh") or ["0"])[0] == "1"))
+            if path == "/api/learning":
+                return self.send_json(learning_report())
             if path == "/api/health":
                 return self.send_json({"ok": True, "time": now_iso(), "running": STATE["running"]})
             return self.send_json({"error": "not found"}, 404)
@@ -4745,6 +5249,18 @@ class Handler(BaseHTTPRequestHandler):
                             v = max(0.2, min(0.9, float(v)))
                         except Exception:
                             continue
+                    if k == "max_same_dir_open":
+                        try:
+                            v = max(0, min(10, int(float(v))))
+                        except Exception:
+                            continue
+                    if k == "cooldown_after_sl_min":
+                        try:
+                            v = max(0, min(1440, int(float(v))))
+                        except Exception:
+                            continue
+                    if k == "block_negative_setups":
+                        v = v if isinstance(v, bool) else str(v).lower() in ("1", "true", "yes", "on")
                     if k == "auto_pilot":
                         v = bool(v)
                         with STATE_LOCK:

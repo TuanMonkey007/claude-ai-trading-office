@@ -152,6 +152,8 @@ table.gm .ord button{padding:1px 6px;font-size:10px;display:block;margin:1px 0}
 .st.ready{background:rgba(46,204,113,.15);color:var(--green)}.st.cooldown,.st.exhausted{background:rgba(255,92,92,.15);color:var(--red)}
 .st.rpm{background:rgba(245,182,60,.15);color:var(--accent)}.st.off{background:#1f2840;color:var(--muted)}
 .st small{font-weight:500;opacity:.85}
+.lr-kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:6px 0}
+@media(max-width:700px){.lr-kpis{grid-template-columns:repeat(2,1fr)}}
 .llm-order{list-style:none;margin:4px 0 0;padding:0;border:1px solid var(--line);border-radius:10px;overflow:hidden}
 .llm-order li{display:flex;align-items:center;gap:10px;padding:9px 11px;background:var(--panel2);border-top:1px solid var(--line);cursor:grab}
 .llm-order li:first-child{border-top:none}
@@ -278,6 +280,7 @@ table.gm .ord button{padding:1px 6px;font-size:10px;display:block;margin:1px 0}
       <button data-tab="fund">💰 Quỹ & Auto-Pilot</button>
       <button data-tab="ea">🤖 EA MT5</button>
       <button data-tab="agents">🧩 Agent</button>
+      <button data-tab="learn">🧪 Tự học</button>
     </div>
     <p class="note">Lưu tại <code>data/config.json</code> trên server. Ô key để trống = giữ nguyên key cũ.</p>
     <div id="form">
@@ -337,6 +340,10 @@ table.gm .ord button{padding:1px 6px;font-size:10px;display:block;margin:1px 0}
       <label>% Rủi ro mỗi lệnh <input name="risk_per_trade_pct" type="number" step="0.1" min="0.1" max="10"></label>
       <label>Khung thời gian <select name="timeframe"><option>5m</option><option>15m</option><option>1h</option><option>4h</option></select></label>
       <label>Chu kỳ Auto-Pilot (phút) <input name="auto_interval_min" type="number" min="5" step="5"></label>
+      <div class="sec">Chặn dồn lệnh & tự học (kèo bị chặn sẽ thành WAIT: không gửi Telegram, EA không vào)</div>
+      <label>Số kèo thật đang mở tối đa cùng tài sản cùng chiều (0 = tắt) <input name="max_same_dir_open" type="number" min="0" max="10" step="1"></label>
+      <label>Nghỉ chiều đó sau khi 1 kèo cùng chiều đóng lỗ (phút, 0 = tắt) <input name="cooldown_after_sl_min" type="number" min="0" max="1440" step="5"></label>
+      <label class="full">Chặn setup kỳ vọng âm <select name="block_negative_setups"><option value="true">Bật — hạ WAIT khi setup hiện tại có ≥ 15 lệnh và kỳ vọng R &lt; 0</option><option value="false">Tắt — chỉ đưa thống kê setup vào prompt</option></select></label>
       </div>
     </div>
     <div class="pane" data-pane="ea" hidden>
@@ -352,6 +359,7 @@ table.gm .ord button{padding:1px 6px;font-size:10px;display:block;margin:1px 0}
       <label>Symbol BTC trên broker (trống = BTC lấy từ Binance) <input name="ea_btc_symbol" placeholder="BTCUSDm"></label>
       <label>Đẩy giá realtime lên server <select name="ea_enable_price_bridge"><option value="true">Bật</option><option value="false">Tắt</option></select></label>
       <label>Chu kỳ đẩy tick (ms) / nến (giây) <span style="display:flex;gap:6px"><input name="ea_tick_interval_ms" type="number" min="200" step="100" style="flex:1"><input name="ea_candle_interval_sec" type="number" min="5" step="5" style="flex:1"></span></label>
+      <label>Số nến mỗi khung EA gửi (≥ 700 để EMA200 chính xác) <input name="ea_bridge_bars" type="number" min="300" max="1200" step="100"></label>
       <label>Chế độ khớp lệnh <select name="ea_dry_run"><option value="true">DryRun — chỉ in log, KHÔNG đặt lệnh</option><option value="false">Thật — EA được đặt lệnh</option></select></label>
       <label>Cho phép đặt lệnh (phải Bật cùng với tắt DryRun) <select name="ea_enable_trading"><option value="false">Tắt</option><option value="true">Bật</option></select></label>
       <label>EA chỉ vào kèo có tự tin ≥ (%) <input name="ea_min_confidence" type="number" min="50" max="95" step="5"></label>
@@ -378,11 +386,32 @@ table.gm .ord button{padding:1px 6px;font-size:10px;display:block;margin:1px 0}
         <thead><tr><th>Agent</th><th>Số phiếu</th><th>Đúng</th><th>Tỷ lệ đúng</th><th>Trọng số gốc</th><th>Hệ số</th><th>Trọng số hiện tại</th></tr></thead>
         <tbody></tbody>
       </table></div>
-      <p class="hint">Chỉ chấm kèo BUY/SELL đã được EA khớp lệnh thật (không tính DryRun). Kết quả lấy từ lịch sử giao dịch EA gửi về (lệnh TP1 lãi = đúng); kèo chưa có lịch sử thì dò nến MT5: chạm TP1 trước SL là đúng. Phiếu WAIT không tính. Hệ số chỉ áp dụng khi bật tự chỉnh và agent có từ 20 phiếu. Trong mỗi phiên họp, trọng số còn nhân thêm theo trạng thái thị trường: <b>xu hướng</b> tăng VWAP/Trend/Khung lớn, <b>đi ngang</b> tăng SMC/Mốc giá và giảm Trend.</p>
+      <p class="hint">Chỉ chấm kèo BUY/SELL đã được EA khớp lệnh thật (không tính DryRun). Kết quả lấy từ lịch sử giao dịch EA gửi về (lệnh TP1 lãi = đúng); kèo chưa có lịch sử thì dò nến MT5: chạm TP1 trước SL là đúng. Kèo thua nhưng không sai hướng (MFE ≥ 0.3R, xem tab Tự học) không trừ điểm agent nào. Phiếu WAIT không tính. Hệ số chỉ áp dụng khi bật tự chỉnh và agent có từ 20 phiếu. Trong mỗi phiên họp, trọng số còn nhân thêm theo trạng thái thị trường: <b>xu hướng</b> tăng VWAP/Trend/Khung lớn, <b>đi ngang</b> tăng SMC/Mốc giá và giảm Trend.</p>
       <div class="gm-wrap"><table class="gm" id="scRecent">
         <thead><tr><th>Kèo</th><th>Tài sản</th><th>Lệnh</th><th>Kết quả</th><th>Nguồn</th><th>Phiếu</th></tr></thead>
         <tbody></tbody>
       </table></div>
+    </div>
+    <div class="pane" data-pane="learn" hidden>
+      <div class="gm-head"><span id="lrInfo" class="muted">Đang tải dữ liệu tự học...</span><span class="spacer"></span><button class="btn-ghost sm" id="lrRefresh">↻ Tải lại</button></div>
+      <div class="sec" style="font-weight:700;margin-top:6px">1. Chặn dồn lệnh & cooldown sau SL (hiện tại)</div>
+      <div class="gm-wrap"><table class="gm" id="lrGuards">
+        <thead><tr><th>Tài sản</th><th>Chiều</th><th>Kèo thật đang mở</th><th>Cooldown sau SL</th><th>Trạng thái</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <div class="sec" style="font-weight:700;margin-top:14px">2. MFE / MAE của 30 kèo gần nhất có kết quả</div>
+      <div class="lr-kpis" id="lrKpis"></div>
+      <div class="gm-wrap" style="max-height:260px;overflow-y:auto"><table class="gm" id="lrMfe">
+        <thead><tr><th>Kèo</th><th>Tài sản</th><th>Lệnh</th><th>Kết quả</th><th>R</th><th title="Mức thuận tối đa">MFE</th><th title="Mức ngược tối đa">MAE</th><th>Nhãn</th><th>Setup</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <p class="hint" id="lrMfeNote"></p>
+      <div class="sec" style="font-weight:700;margin-top:14px">3. Thống kê theo setup</div>
+      <div class="gm-wrap" style="max-height:320px;overflow-y:auto"><table class="gm" id="lrSetups">
+        <thead><tr><th>Tài sản</th><th>Chiều</th><th>Trạng thái</th><th>Cấu trúc</th><th>Vùng VWAP</th><th>Phiên</th><th>Số lệnh</th><th>Thắng</th><th>Kỳ vọng</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <p class="hint" id="lrSetupNote"></p>
     </div>
     </div>
     <div class="actions">
@@ -1169,17 +1198,18 @@ async function meeting(asset){ const r=await post('/api/meeting',{asset}); toast
 $('#btnGold').onclick=()=>meeting('XAUUSD'); $('#btnBtc').onclick=()=>meeting('BTCUSDT');
 $('#btnAuto').onclick=async()=>{ const on=!$('#btnAuto').dataset.on; const r=await post('/api/autopilot',{enabled:on}); toast('Auto-Pilot '+(r.auto_pilot?'BẬT — họp Vàng & BTC định kỳ':'TẮT')); poll(); };
 const modal=$('#modal'), form=$('#form');
-const TAB_TITLES={ai:'🧠 Cài Đặt AI & API Key',tg:'📨 Telegram & Tin tức',fund:'💰 Quỹ & Auto-Pilot',ea:'🤖 Cài Đặt EA MetaTrader 5',agents:'🧩 Agent bỏ phiếu & Bảng điểm'};
+const TAB_TITLES={ai:'🧠 Cài Đặt AI & API Key',tg:'📨 Telegram & Tin tức',fund:'💰 Quỹ & Auto-Pilot',ea:'🤖 Cài Đặt EA MetaTrader 5',agents:'🧩 Agent bỏ phiếu & Bảng điểm',learn:'🧪 Tự học: setup, MFE/MAE & chặn dồn lệnh'};
 let gmModels=[], gmStatus={}, gmTimer=null, curTab='ai';
 function showTab(t){ curTab=t; $('#modalTitle').textContent=TAB_TITLES[t];
   document.querySelectorAll('#tabs button').forEach(b=>b.classList.toggle('active',b.dataset.tab===t));
   document.querySelectorAll('.pane').forEach(p=>p.hidden=p.dataset.pane!==t);
   document.querySelectorAll('[data-only]').forEach(b=>b.style.display=b.dataset.only===t?'':'none');
   clearInterval(gmTimer); if(t==='ai'){ loadGmStatus(); gmTimer=setInterval(loadGmStatus,5000); }
-  if(t==='agents') loadScorecard(); }
+  if(t==='agents') loadScorecard();
+  if(t==='learn') loadLearning(); }
 const AGENT_EMOJI={vwap_hunter:'🟣',smc_sniper:'🩷',trend_radar:'🟢',htf_scout:'🦅',regime_meter:'🐱',level_mapper:'🦊',volume_whale:'🐳'};
 async function loadScorecard(refresh){ try{ const d=await api('/api/agents/scorecard'+(refresh?'?refresh=1':'')); if(d.error) throw new Error(d.error);
-    const sg=d.signals; $('#scInfo').innerHTML=`<b>${sg.executed}</b> kèo đã khớp thật · chấm được <b>${sg.evaluated}</b> (${sg.wins} đúng / ${sg.losses} sai${sg.win_rate!=null?' · '+sg.win_rate+'%':''}) · chờ kết quả <b>${sg.pending}</b> · tự chỉnh trọng số: <b style="color:${d.auto_weight?'var(--green)':'var(--muted)'}">${d.auto_weight?'BẬT':'TẮT'}</b>`;
+    const sg=d.signals; $('#scInfo').innerHTML=`<b>${sg.executed}</b> kèo đã khớp thật · chấm được <b>${sg.evaluated}</b> (${sg.wins} đúng / ${sg.losses} sai${sg.win_rate!=null?' · '+sg.win_rate+'%':''}${sg.neutral_losses?` · <span title="Thua nhưng MFE ≥ 0.3R: không trừ điểm agent">${sg.neutral_losses} thua không sai hướng</span>`:''}) · chờ kết quả <b>${sg.pending}</b> · tự chỉnh trọng số: <b style="color:${d.auto_weight?'var(--green)':'var(--muted)'}">${d.auto_weight?'BẬT':'TẮT'}</b>`;
     $('#scTable tbody').innerHTML=d.agents.map(a=>{ const enough=a.votes>=d.min_votes; const accCol=a.accuracy==null?'':a.accuracy>=50?'var(--green)':'var(--red)';
       return `<tr><td>${AGENT_EMOJI[a.id]||''} <b>${esc(a.name)}</b> <span class="muted">${esc(a.label)}</span></td><td>${a.votes}</td><td>${a.correct}</td>
         <td style="color:${accCol};font-weight:700">${a.accuracy==null?'—':a.accuracy+'%'}</td><td>${fmt(a.base_weight,2)}</td>
@@ -1191,6 +1221,38 @@ async function loadScorecard(refresh){ try{ const d=await api('/api/agents/score
       :'<tr><td colspan="6" class="muted" style="text-align:center;padding:12px">Chưa có kèo nào được EA khớp lệnh thật</td></tr>';
   }catch(e){ $('#scInfo').textContent='Không tải được bảng điểm: '+e.message; } }
 $('#scRefresh').onclick=()=>loadScorecard(true);
+const MFE_CLS={wrong_direction:['Sai hướng','cooldown'],stop_too_tight:['SL quá chặt','rpm'],good:['Hướng đúng','ready']};
+const fmtR=v=>v==null||isNaN(v)?'—':(v>0?'+':'')+Number(v).toFixed(2)+'R';
+async function loadLearning(){ try{ const d=await api('/api/learning'); if(d.error) throw new Error(d.error);
+    const c=d.config||{}, th=d.thresholds||{};
+    $('#lrInfo').innerHTML=`Giới hạn <b>${esc(c.max_same_dir_open)}</b> kèo mở/chiều · cooldown <b>${esc(c.cooldown_after_sl_min)}</b> phút · chặn setup âm: <b style="color:${c.block_negative_setups?'var(--green)':'var(--muted)'}">${c.block_negative_setups?'BẬT':'TẮT'}</b> <span class="muted">(sửa ở tab Quỹ)</span>`;
+    $('#lrGuards tbody').innerHTML=(d.guards||[]).map(g=>{ const blocked=g.reasons&&g.reasons.length;
+      const openTxt=`<b>${esc(g.open)}</b> / ${g.limit>0?esc(g.limit):'∞'}${g.open_signals&&g.open_signals.length?` <span class="muted">(${esc(g.open_signals.map(i=>'#'+i).join(', '))} · ${esc(g.positions)} lệnh MT5)</span>`:''}${g.pending&&g.pending.length?` <span class="muted">· chờ EA: ${esc(g.pending.map(i=>'#'+i).join(', '))}</span>`:''}`;
+      const cdTxt=g.cooldown_left_sec>0?`<span class="st cooldown">còn ${esc(Math.ceil(g.cooldown_left_sec/60))} phút</span> <span class="muted">sau SL kèo #${esc(g.last_loss_signal)} (${esc(g.last_loss_at)})</span>`
+        :(g.last_loss_signal?`<span class="muted">hết · lỗ gần nhất #${esc(g.last_loss_signal)} ${esc(g.last_loss_at)}</span>`:'<span class="muted">—</span>');
+      return `<tr><td>${esc(g.asset)}</td><td style="color:${voteColor(g.action)};font-weight:700">${esc(g.action)}</td><td>${openTxt}</td><td>${cdTxt}</td>
+        <td>${blocked?`<span class="st cooldown" title="${esc(g.reasons.join(' | '))}">⛔ Đang chặn</span>`:'<span class="st ready">Cho phép</span>'}</td></tr>`; }).join('');
+    const m=d.mfe||{}, cn=m.counts||{}, pc=m.pct||{}; const pctTxt=k=>pc[k]==null?'—':pc[k]+'%';
+    $('#lrKpis').innerHTML=[['Sai hướng (MFE < '+esc(th.wrong_r)+'R)','wrong_direction','var(--red)'],['SL quá chặt (MFE ≥ '+esc(th.tight_r)+'R rồi dính SL)','stop_too_tight','var(--accent)'],['Hướng đúng','good','var(--green)']]
+      .map(([t,k,col])=>`<div class="kpi"><b>${t}</b><span style="color:${col}">${esc(pctTxt(k))}</span> <span class="muted">${esc(cn[k]||0)} kèo</span></div>`).join('')
+      +`<div class="kpi"><b>Chưa đo được (thiếu nến M5)</b><span>${esc(cn.unknown||0)}</span> <span class="muted">/ ${esc(m.total||0)} kèo</span></div>`;
+    $('#lrMfe tbody').innerHTML=(m.rows||[]).length?m.rows.map(r=>{ const cl=MFE_CLS[r.mfe_class];
+      return `<tr><td>#${esc(r.signal_id)}</td><td>${esc(r.asset)}</td><td style="color:${voteColor(r.action)};font-weight:700">${esc(r.action)}</td>
+        <td>${r.outcome==='win'?`<span class="st ready">${esc(r.exit_reason||'Thắng')}</span>`:`<span class="st cooldown">${esc(r.exit_reason||'SL')}</span>`}</td>
+        <td style="color:${r.r>=0?'var(--green)':'var(--red)'}">${esc(fmtR(r.r))}</td>
+        <td title="${esc(r.mfe==null?'':fmt(r.mfe,2))}">${esc(fmtR(r.mfe_r))}</td><td title="${esc(r.mae==null?'':fmt(r.mae,2))}">${r.mae_r==null?'—':'-'+esc(Number(r.mae_r).toFixed(2))+'R'}</td>
+        <td>${cl?`<span class="st ${cl[1]}">${esc(cl[0])}</span>`:'<span class="st off">chưa đo</span>'}</td><td class="muted">${esc(r.setup)}</td></tr>`; }).join('')
+      :'<tr><td colspan="9" class="muted" style="text-align:center;padding:12px">Chưa có kèo nào (khớp thật hoặc đã gửi Telegram) có kết quả</td></tr>';
+    $('#lrMfeNote').innerHTML=`MFE/MAE đo trên nến MT5 M5 từ lúc vào lệnh tới lúc đóng, R = khoảng cách entry → SL. Chỉ kèo <b>sai hướng</b> mới bị trừ điểm agent ở bảng điểm; kèo thua do SL quá chặt hoặc thua thường không trừ.`;
+    const st=d.setups||[];
+    $('#lrSetups tbody').innerHTML=st.length?st.map(r=>{ const enough=r.n>=th.min_show;
+      const tag=r.blocking?(c.block_negative_setups?'<span class="st cooldown">⛔ Đang chặn</span>':'<span class="st cooldown">Âm (chưa bật chặn)</span>'):(enough?'<span class="st ready">Đủ mẫu</span>':`<span class="st off">cần ≥ ${esc(th.min_show)}</span>`);
+      return `<tr class="${enough?'':'off'}"><td>${esc(r.asset)}</td><td style="color:${voteColor(r.action)};font-weight:700">${esc(r.action)}</td><td>${esc(r.regime)}</td><td>${esc(r.structure)}</td><td>${esc(r.vwap_zone)}</td><td>${esc(r.session)}</td>
+        <td><b>${esc(r.n)}</b></td><td>${esc(r.win_rate)}% <span class="muted">(${esc(r.wins)}/${esc(r.losses)})</span></td><td style="color:${r.exp_r>=0?'var(--green)':'var(--red)'};font-weight:700">${esc(fmtR(r.exp_r))}</td><td>${tag}</td></tr>`; }).join('')
+      :'<tr><td colspan="10" class="muted" style="text-align:center;padding:12px">Chưa có dữ liệu setup</td></tr>';
+    $('#lrSetupNote').innerHTML=`Setup = tài sản · chiều · trạng thái thị trường · cấu trúc · vùng VWAP · phiên (UTC: Á 21h–7h, London 7h–12h, NY 12h–21h). Prompt LLM nhận 5 setup tốt nhất và 5 tệ nhất có ≥ ${esc(th.min_show)} lệnh. Setup có ≥ ${esc(th.min_block)} lệnh và kỳ vọng âm bị hạ WAIT khi bật chặn.`;
+  }catch(e){ $('#lrInfo').textContent='Không tải được dữ liệu tự học: '+e.message; } }
+$('#lrRefresh').onclick=()=>loadLearning();
 document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>showTab(b.dataset.tab));
 const SECRET_KEYS=['gemini_api_key','groq_api_key','openrouter_api_key','custom_api_key','telegram_bot_token','cryptocompare_api_key','bridge_token'];
 // Ô secret luôn để trống: chỉ hiện placeholder "(đã lưu …1234)", không bao giờ đổ chuỗi đã che vào value
@@ -1310,7 +1372,7 @@ $('#btnSave').onclick=async()=>{ const body={}; for(const el of form.querySelect
   let r; try{ r=await post('/api/config',body); }catch(e){ return toast('❌ Mất kết nối server, chưa lưu được'); }
   if(r.ok){ const ch=r.changed||[]; toast('Đã lưu: '+(ch.length?ch.length+' mục':'không đổi'));
     if(r.config){ lastCfg=r.config; initLlmOrder(lastCfg); fillSecretInputs(lastCfg); } renderLlmOrder(lastCfg);
-    gmModels=null; loadGmStatus(); poll(); if(curTab==='agents') loadScorecard(true); } else toast('Lỗi: '+(r.error||'không rõ')); };
+    gmModels=null; loadGmStatus(); poll(); if(curTab==='agents') loadScorecard(true); if(curTab==='learn') loadLearning(); } else toast('Lỗi: '+(r.error||'không rõ')); };
 $('#btnTestLlm').onclick=async()=>{ toast('Đang test chuỗi LLM (Gemini → Groq → ...)...'); const r=await post('/api/llm/test'); toast(r.ok?'✅ LLM OK qua '+r.provider:'❌ '+((r.errors||[]).join(' | ')||r.error||'Chưa có key → dùng Quant AI')); loadGmStatus(); };
 $('#btnTestTg').onclick=async()=>{ toast('Đang gửi Telegram...'); const r=await post('/api/telegram/test'); toast(r.ok?'✅ Telegram đã nhận tin':'❌ Telegram: '+r.message); };
 </script>
