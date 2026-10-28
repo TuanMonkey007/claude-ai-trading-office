@@ -77,7 +77,7 @@ HOST = os.environ.get("OFFICE_HOST", "0.0.0.0")
 ADMIN_USER = os.environ.get("OFFICE_ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.environ.get("OFFICE_ADMIN_PASSWORD", "")
 # Các endpoint EA được gọi bằng X-Bridge-Token thay cho mật khẩu dashboard
-EA_PATHS = ("/api/push_price", "/api/push_account", "/api/push_history", "/api/ea/config", "/api/signals", "/api/execution", "/api/health")
+EA_PATHS = ("/api/push_price", "/api/push_account", "/api/push_history", "/api/push_closed", "/api/ea/config", "/api/signals", "/api/execution", "/api/health")
 PORT = int(os.environ.get("OFFICE_PORT", "8080"))
 
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -2288,8 +2288,8 @@ def _infer_exit_reason(action, open_price, close_price, sl, tp, comment="", raw_
     r = str(raw_reason or "").upper().strip()
     cmt = str(comment or "").upper()
     leg = "TP1" if "/TP1" in cmt else ("TP2" if "/TP2" in cmt else "")
-    if r in ("TP1", "TP2", "BE", "SO"):
-        return r
+    if r in ("TP1", "TP2", "BE", "SO", "MANUAL", "EA"):
+        return r                        # MT5 đã cho biết rõ: không đoán theo khoảng cách giá
     if r == "TP" or "[TP" in cmt:
         return leg or "TP"
     if r == "SL" or "[SL" in cmt:
@@ -2325,6 +2325,81 @@ def _fmt_epoch_time(ts_val):
         return datetime.fromtimestamp(int(float(ts_val)), timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return str(ts_val)[:19]
+
+
+EXIT_REASON_VI = {"MANUAL": "đóng tay", "EA": "EA tự đóng", "SO": "stop-out (thiếu margin)",
+                  "KHÔNG RÕ": "đã đóng, không rõ lý do"}
+RECON_LOCK = threading.Lock()
+RECON_ASKED = {}       # ticket -> lần cuối yêu cầu EA tra cứu (epoch)
+RECON_MISSES = {}      # ticket -> số lần EA báo không tìm thấy lịch sử
+
+
+def reconcile_open_executions(open_tickets):
+    """Lệnh server ghi 'đang mở' nhưng không còn trong danh sách vị thế MT5 => đã đóng (SL/TP/đóng tay/stop-out...).
+    Trả về tối đa 20 ticket cần EA tra lịch sử. open_tickets là DANH SÁCH ĐẦY ĐỦ vị thế đang mở trên tài khoản."""
+    open_set = set()
+    for t in open_tickets or []:
+        try:
+            open_set.add(int(t))
+        except (TypeError, ValueError):
+            pass
+    with DB_LOCK:
+        conn = db_conn()
+        rows = conn.execute("""SELECT ticket, created_at FROM executions
+            WHERE dry_run = 0 AND ticket > 0 AND (error IS NULL OR error = '')
+              AND (status IS NULL OR status NOT IN ('closed', 'skipped', 'error', 'missing'))
+            ORDER BY id DESC LIMIT 500""").fetchall()
+        conn.close()
+    now = time.time()
+    ask = []
+    with RECON_LOCK:
+        for r in rows:
+            tk = int(r["ticket"])
+            if tk in open_set:
+                RECON_MISSES.pop(tk, None)
+                continue
+            try:      # lệnh vừa đặt vài giây có thể chưa kịp xuất hiện trong danh sách vị thế
+                if now - time.mktime(time.strptime(str(r["created_at"])[:19], "%Y-%m-%d %H:%M:%S")) < 30:
+                    continue
+            except ValueError:
+                pass
+            if now - RECON_ASKED.get(tk, 0) < 60:
+                continue
+            RECON_ASKED[tk] = now
+            ask.append(tk)
+            if len(ask) >= 20:
+                break
+    return ask
+
+
+def receive_closed_lookup(body):
+    """EA trả lời yêu cầu tra cứu: closed = lệnh đã đóng (đủ thông tin), missing = MT5 không có lịch sử."""
+    closed = [c for c in (body.get("closed") or [])[:50] if isinstance(c, dict)]
+    n = sync_closed_deals(closed) if closed else 0
+    marked = []
+    for tk in (body.get("missing") or [])[:50]:
+        try:
+            tk = int(tk)
+        except (TypeError, ValueError):
+            continue
+        with RECON_LOCK:
+            RECON_MISSES[tk] = RECON_MISSES.get(tk, 0) + 1
+            give_up = RECON_MISSES[tk] >= 3
+        if give_up:
+            with DB_LOCK:
+                conn = db_conn()
+                cur = conn.execute("""UPDATE executions SET status='missing', exit_reason='KHÔNG RÕ'
+                    WHERE ticket=? AND (status IS NULL OR status NOT IN ('closed','skipped','error','missing'))""", (tk,))
+                conn.commit()
+                conn.close()
+            if cur.rowcount:
+                marked.append(tk)
+                log("vault_piggy", "❔ Lệnh #%d không còn mở trên MT5 và không tìm thấy lịch sử (có thể đã bị xoá khỏi "
+                    "lịch sử terminal). Đánh dấu 'không rõ'." % tk, room="vault_room")
+    for c in closed:
+        with RECON_LOCK:
+            RECON_MISSES.pop(int(c.get("position") or 0), None)
+    return {"ok": True, "signals_updated": n, "marked_missing": marked}
 
 
 def sync_closed_deals(closed_list):
@@ -2395,8 +2470,8 @@ def sync_closed_deals(closed_list):
         SCORE_CACHE["ts"] = 0
     for sid, sym, act, tk, rsn, cp, net in newly_logged[:10]:
         icon = "🏆" if rsn in ("TP", "TP1", "TP2") else ("🛡️" if rsn == "BE" else ("🛑" if rsn == "SL" else "📌"))
-        log("vault_piggy", "%s Lệnh #%d (kèo #%d %s %s) đã đóng: chạm %s @%s · Lãi/lỗ: %+.2f USD" % (
-            icon, tk, sid, sym, act, rsn, "{:g}".format(cp), net), room="vault_room")
+        log("vault_piggy", "%s Lệnh #%d (kèo #%d %s %s) đã đóng: %s @%s · Lãi/lỗ: %+.2f USD" % (
+            icon, tk, sid or 0, sym, act, EXIT_REASON_VI.get(rsn, "chạm " + rsn), "{:g}".format(cp), net), room="vault_room")
     return len(updated_signals)
 
 
@@ -3885,6 +3960,14 @@ def send_telegram_sl_tp_alert(cfg, sig, oc):
         head_icon, title_tag = "🏆", "CHẠM TAKE PROFIT (%s)" % rsn
     elif rsn == "BE":
         head_icon, title_tag = "🛡️", "ĐÓNG HOÀ VỐN (BREAKEVEN)"
+    elif "MANUAL" in rsn:
+        head_icon, title_tag = ("✋", "ĐÓNG TAY (%s)" % ("CÓ LÃI" if net >= 0 else "CẮT LỖ"))
+    elif rsn.startswith("EA"):
+        head_icon, title_tag = ("🤖", "EA ĐÓNG LỆNH")
+    elif rsn.startswith("SO"):
+        head_icon, title_tag = ("💥", "STOP-OUT (THIẾU MARGIN)")
+    elif rsn.startswith("KHÔNG RÕ"):
+        head_icon, title_tag = ("❔", "ĐÃ ĐÓNG, KHÔNG RÕ LÝ DO")
     else:
         head_icon, title_tag = "🛑", "DÍNH STOP LOSS (%s)" % rsn
 
@@ -4677,10 +4760,19 @@ class Handler(BaseHTTPRequestHandler):
                 if token and (self.headers.get("X-Bridge-Token") or body.get("token")) != token:
                     return self.send_json({"error": "sai bridge_token"}, 403)
                 res = account_push(body)
+                if isinstance(body.get("open_tickets"), list):      # EA >= 1.32 gửi đủ danh sách vị thế đang mở
+                    lk = reconcile_open_executions(body.get("open_tickets"))
+                    if lk:
+                        res["lookup_positions"] = lk
                 hr = stats_pending_for_ea()
                 if hr:
                     res["history_request"] = hr
                 return self.send_json(res)
+            if path == "/api/push_closed":
+                token = CONFIG.get("bridge_token") or ""
+                if token and self.headers.get("X-Bridge-Token") != token:
+                    return self.send_json({"error": "sai bridge_token"}, 403)
+                return self.send_json(receive_closed_lookup(body))
             if path == "/api/push_history":
                 token = CONFIG.get("bridge_token") or ""
                 if token and self.headers.get("X-Bridge-Token") != token:

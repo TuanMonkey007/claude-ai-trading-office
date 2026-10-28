@@ -975,9 +975,13 @@ async function loadSlTpHistory(){
       const d=(e.symbol||'').toUpperCase().includes('BTC')?1:2;
       const rsn=(e.exit_reason||e.candle_exit_reason||'').toUpperCase();
       let stBadge='<span class="st off">Đang mở</span>';
+      const RSN_VI={MANUAL:'✋ Đóng tay',EA:'🤖 EA đóng',SO:'💥 Stop-out','KHÔNG RÕ':'❔ Không rõ'};
       if(e.status==='closed'){
-        const c=rsn.includes('TP')?'ready':(rsn==='BE'?'rpm':'cooldown');
-        stBadge=`<span class="st ${c}">${esc(e.exit_reason||'ĐÓNG')}</span>`;
+        const lbl=RSN_VI[rsn]||e.exit_reason||'ĐÓNG';
+        const c=RSN_VI[rsn]?((e.profit||0)>=0?'ready':'cooldown'):(rsn.includes('TP')?'ready':(rsn==='BE'?'rpm':'cooldown'));
+        stBadge=`<span class="st ${c}">${esc(lbl)}</span>`;
+      } else if(e.status==='missing'){
+        stBadge='<span class="st off" title="Lệnh không còn mở trên MT5 và terminal không còn lịch sử của lệnh này">❔ Đã đóng, không rõ</span>';
       } else if(e.dry_run){
         stBadge=`<span class="st off">DryRun${rsn?` · Nến: ${esc(rsn)}`:''}</span>`;
       } else if(rsn){

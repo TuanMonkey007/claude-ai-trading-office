@@ -1,4 +1,4 @@
-//+------------------------------------------------------------------+
+﻿//+------------------------------------------------------------------+
 //|                                          AITradingOffice.mq5     |
 //|   EA DUY NHẤT cho "Văn phòng AI Trading 2D" trên VPS Exness:      |
 //|   (1) CẦU NỐI GIÁ: đẩy bid/ask realtime + nến M5/M15/H1/H4 lên    |
@@ -53,8 +53,8 @@
 //  ---------------------------------------------------------------
 #property copyright "AI Trading Office"
 #property link      "https://github.com/"
-#property version   "1.31"
-#define  EA_VERSION  "1.31"
+#property version   "1.32"
+#define  EA_VERSION  "1.32"
 #property description "Cầu nối giá realtime + khớp lệnh (demo) cho AI Trading Office server"
 
 #include <Trade\Trade.mqh>
@@ -1817,7 +1817,8 @@ string DealReasonTxt(long r, const string cmt)
    if(r == DEAL_REASON_TP || StringFind(cmt, "[tp") >= 0) return "TP";
    if(r == DEAL_REASON_SL || StringFind(cmt, "[sl") >= 0) return "SL";
    if(r == DEAL_REASON_SO || StringFind(cmt, "[so") >= 0) return "SO";
-   return "MANUAL";
+   if(r == DEAL_REASON_EXPERT) return "EA";
+   return "MANUAL";          // đóng tay trên PC / điện thoại / web và các lý do khác
   }
 
 ulong    g_lastClosedDeal = 0;     // deal đóng mới nhất server ĐÃ NHẬN (chỉ tăng khi push_account 200)
@@ -1900,6 +1901,96 @@ string BuildRecentClosedJson()
    return "[" + arr + "]";
   }
 
+//+------------------------------------------------------------------+
+//| TRA CỨU LỆNH ĐÃ ĐÓNG THEO MÃ VỊ THẾ (server hỏi khi lệnh biến mất) |
+//+------------------------------------------------------------------+
+// Gom mọi deal của 1 vị thế: giá/chiều/comment lúc vào; tổng khối lượng, lãi lỗ ròng (cả phí
+// lúc vào), giá/giờ/lý do của lần đóng cuối. Trả "" nếu vị thế còn mở hoặc chưa có deal đóng.
+string ClosedPositionJson(long pid, bool &missing)
+  {
+   missing = false;
+   if(PositionSelectByTicket((ulong)pid)) return "";          // vẫn đang mở
+   if(!HistorySelectByPosition(pid)) { missing = true; return ""; }
+   int n = HistoryDealsTotal();
+   double openPrice = 0, closePrice = 0, net = 0, vol = 0;
+   long openType = -1, lastDeal = 0, lastTime = 0, rsn = -1, mg = 0;
+   string openCmt = "", closeCmt = "", sym = "";
+   int outs = 0;
+   for(int i = 0; i < n; i++)
+     {
+      ulong d = HistoryDealGetTicket(i);
+      if(d == 0) continue;
+      long typ = HistoryDealGetInteger(d, DEAL_TYPE);
+      if(typ != DEAL_TYPE_BUY && typ != DEAL_TYPE_SELL) continue;
+      if(sym == "") sym = HistoryDealGetString(d, DEAL_SYMBOL);
+      net += HistoryDealGetDouble(d, DEAL_PROFIT) + HistoryDealGetDouble(d, DEAL_COMMISSION) +
+             HistoryDealGetDouble(d, DEAL_SWAP) + HistoryDealGetDouble(d, DEAL_FEE);
+      long entry = HistoryDealGetInteger(d, DEAL_ENTRY);
+      if(entry == DEAL_ENTRY_IN)
+        {
+         openPrice = HistoryDealGetDouble(d, DEAL_PRICE);
+         openType  = typ;
+         openCmt   = HistoryDealGetString(d, DEAL_COMMENT);
+         mg        = HistoryDealGetInteger(d, DEAL_MAGIC);
+        }
+      else
+        {
+         outs++;
+         vol       += HistoryDealGetDouble(d, DEAL_VOLUME);
+         closePrice = HistoryDealGetDouble(d, DEAL_PRICE);
+         lastTime   = HistoryDealGetInteger(d, DEAL_TIME);
+         lastDeal   = (long)d;
+         rsn        = HistoryDealGetInteger(d, DEAL_REASON);
+         closeCmt   = HistoryDealGetString(d, DEAL_COMMENT);
+        }
+     }
+   if(outs == 0) { missing = true; return ""; }               // không có deal đóng trong lịch sử terminal
+   int dg = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   string fullCmt = (openCmt != "" ? openCmt : closeCmt);
+   string side = (openType == DEAL_TYPE_BUY ? "BUY" : "SELL");
+   return "{\"deal_ticket\":" + IntegerToString(lastDeal) +
+          ",\"position\":" + IntegerToString(pid) +
+          ",\"signal_id\":" + IntegerToString(SignalIdFromComment(fullCmt)) +
+          ",\"symbol\":\"" + JsonEscape(sym) + "\"" +
+          ",\"side\":\"" + side + "\"" +
+          ",\"volume\":" + AccD(vol, 2) +
+          ",\"open_price\":" + AccD(openPrice, dg) +
+          ",\"close_price\":" + AccD(closePrice, dg) +
+          ",\"net\":" + AccD(net, 2) +
+          ",\"reason\":\"" + DealReasonTxt(rsn, closeCmt) + "\"" +
+          ",\"magic\":" + IntegerToString(mg) +
+          ",\"comment\":\"" + JsonEscape(fullCmt) + "\"" +
+          ",\"close_time\":\"" + TimeToString((datetime)lastTime, TIME_DATE | TIME_SECONDS) + "\"}";
+  }
+
+void HandleLookupPositions(const string arr)
+  {
+   // arr dạng "[123,456]" -> tách số
+   string body = arr;
+   StringReplace(body, "[", "");
+   StringReplace(body, "]", "");
+   StringReplace(body, " ", "");
+   if(body == "") return;
+   string ids[];
+   int k = StringSplit(body, ',', ids);
+   string closed = "", missing = "";
+   int nc = 0, nm = 0;
+   for(int i = 0; i < k && i < 20; i++)
+     {
+      long pid = StringToInteger(ids[i]);
+      if(pid <= 0) continue;
+      bool miss = false;
+      string js = ClosedPositionJson(pid, miss);
+      if(js != "") { closed += (nc > 0 ? "," : "") + js; nc++; }
+      else if(miss) { missing += (nm > 0 ? "," : "") + IntegerToString(pid); nm++; }
+     }
+   if(nc == 0 && nm == 0) return;
+   string resp;
+   int code = HttpPostJson(ServerUrl + "/api/push_closed", "{\"closed\":[" + closed + "],\"missing\":[" + missing + "]}", resp);
+   Print("[AITO] Tra cứu ", k, " lệnh server báo đã biến mất: ", nc, " đã đóng, ", nm, " không có lịch sử, code=", code);
+   if(nc > 0) UiTicker("Đồng bộ " + IntegerToString(nc) + " lệnh đã đóng (SL/TP/đóng tay) lên server");
+  }
+
 string BuildAccountJson()
   {
    long mode = AccountInfoInteger(ACCOUNT_TRADE_MODE);
@@ -1947,6 +2038,18 @@ string BuildAccountJson()
       js += ",\"comment\":\"" + JsonEscape(PositionGetString(POSITION_COMMENT)) + "\"";
       js += ",\"time\":\"" + TimeToString((datetime)PositionGetInteger(POSITION_TIME), TIME_DATE | TIME_SECONDS) + "\"}";
       added++;
+     }
+   js += "]";
+   js += ",\"positions_total\":" + IntegerToString(total);
+   js += ",\"open_tickets\":[";
+   int nOpen = 0;
+   for(int j = 0; j < total; j++)
+     {
+      ulong tk = PositionGetTicket(j);
+      if(tk == 0) continue;
+      if(nOpen > 0) js += ",";
+      js += IntegerToString((long)tk);
+      nOpen++;
      }
    js += "]";
    string closedJson = BuildRecentClosedJson();
@@ -2089,6 +2192,8 @@ void PushAccount()
      {
       if(g_pendingClosedDeal > g_lastClosedDeal) g_lastClosedDeal = g_pendingClosedDeal;
       g_pendingClosedDeal = 0;
+      string lk = JsonGetRaw(body, "lookup_positions");      // lệnh server ghi 'mở' nhưng đã biến khỏi MT5
+      if(StringLen(lk) > 2 && lk != "null") HandleLookupPositions(lk);
       string req = JsonGetRaw(body, "history_request");     // server chỉ gửi kèm khi bạn bấm xem thống kê
       if(StringLen(req) > 2 && req != "null") HandleHistoryRequest(req);
      }
