@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import math
+import re
 import zlib
 import struct
 import base64
@@ -34,6 +35,38 @@ except ImportError:                                      # CentOS 7 (Python 3.6)
         daemon_threads = True
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def load_dotenv(path):
+    """Đọc .env cạnh server.py (KEY=VALUE) để NSSM/Windows cũng có OFFICE_ADMIN_PASSWORD.
+    Bỏ dòng trống/comment, bỏ tiền tố 'export ', bỏ nháy bao quanh; KHÔNG ghi đè biến môi trường đã có."""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            lines = f.read().splitlines()
+    except Exception:
+        return 0
+    n = 0
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, val = line.split("=", 1)
+        key, val = key.strip(), val.strip()
+        if not key or not all(ch.isalnum() or ch == "_" for ch in key):
+            continue
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        elif " #" in val:
+            val = val.split(" #", 1)[0].rstrip()
+        if key not in os.environ:
+            os.environ[key] = val
+            n += 1
+    return n
+
+
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 SKILLS_DIR = os.path.join(BASE_DIR, "skills")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -86,6 +119,7 @@ DEFAULT_CONFIG = {
     "bridge_stale_sec": 90,
     "use_mt5_balance": True,                  # tính lot theo số dư thật của tài khoản MT5 (nếu EA đang gửi)
     "price_source": "mt5_only",               # mt5_only: chỉ giá MT5 | auto: MT5 -> Binance -> Yahoo
+    "btc_binance_fallback": False,            # mt5_only + BTCUSDT: cho phép dự phòng Binance khi MT5 chưa có BTC (mặc định TẮT)
     "telegram_chat_id": "",
     "telegram_min_confidence": 75,
     "telegram_send_wait": False,
@@ -761,6 +795,8 @@ def mt5_push(payload):
 MT5_ACCOUNT = {"ts": 0, "data": None}
 EQUITY_HIST = deque(maxlen=1440)        # 1 điểm / phút, giữ 24h trong RAM
 EQUITY_LAST = {"t": 0}
+ACCOUNT_CURRENCY_RE = re.compile(r"^[A-Z]{3,5}$")
+ACCOUNT_TRADE_MODES = ("demo", "real", "contest")
 
 
 def account_push(body):
@@ -769,6 +805,14 @@ def account_push(body):
         acc[k] = int(body.get(k) or 0)
     for k in ("server", "company", "currency", "trade_mode", "terminal_time", "ea_version"):
         acc[k] = str(body.get(k) or "")[:80]
+    # currency / trade_mode được dashboard hiển thị khắp nơi -> chỉ nhận giá trị hợp lệ, còn lại bỏ
+    rejected = []
+    if acc["currency"] and not ACCOUNT_CURRENCY_RE.match(acc["currency"]):
+        rejected.append("currency")
+        acc["currency"] = ""
+    if acc["trade_mode"] and acc["trade_mode"] not in ACCOUNT_TRADE_MODES:
+        rejected.append("trade_mode")
+        acc["trade_mode"] = ""
     for k in ("balance", "equity", "margin", "free_margin", "margin_level", "profit", "ea_realized_today", "ea_floating"):
         acc[k] = float(body.get(k) or 0)
     pos = []
@@ -805,6 +849,8 @@ def account_push(body):
             sync_closed_deals(recent_closed)
         except Exception as e:
             print("sync_closed_deals:", e)
+    if rejected:
+        return {"ok": True, "rejected": rejected}
     return {"ok": True}
 
 
@@ -968,7 +1014,7 @@ def compute_stats(p):
         "max_loss_streak": max_streak,
         "return_pct": round(net / start_bal * 100, 2) if start_bal > 0 else None,
         "start_balance": round(start_bal, 2), "end_balance": round(start_bal + net, 2),
-        "balance_now": float(p.get("balance_now") or 0), "currency": p.get("currency", ""),
+        "balance_now": float(p.get("balance_now") or 0), "currency": str(p.get("currency") or "") if ACCOUNT_CURRENCY_RE.match(str(p.get("currency") or "")) else "",
         "deals": len(deals), "truncated": bool(p.get("truncated")),
     }
     recent = [dict(t, net=round(t["net"], 2)) for t in trades[-100:]][::-1]
@@ -1107,19 +1153,20 @@ def fetch_market(asset, tf, max_age=45, publish=True):
     if mt5_live:
         max_age = min(max_age, 1.5)   # MT5 online: làm tươi mượt mỗi 1.5s, kết hợp _IND_CACHE chống tính lặp
     mt5_only = CONFIG.get("price_source", "mt5_only") == "mt5_only"
+    # mt5_only = CHỈ giá MT5. Dự phòng Binance cho BTCUSDT chỉ khi bật riêng btc_binance_fallback (mặc định tắt)
+    btc_fb = mt5_only and asset == "BTCUSDT" and bool(CONFIG.get("btc_binance_fallback", False))
     with MARKET_CACHE_LOCK:
         c = MARKET_CACHE.get(key)
-        if c and time.time() - c["ts"] < max_age and (not mt5_only or c["data"]["source"].startswith("mt5:") or asset == "BTCUSDT"):
+        if c and time.time() - c["ts"] < max_age and (not mt5_only or c["data"]["source"].startswith("mt5:") or btc_fb):
             return c["data"]
     errors = []
-    # Với BTCUSDT: nếu MT5 chưa bật/chưa có nến BTCUSDm thì tự động dự phòng sang Binance BTCUSDT (vì giá BTC chuẩn 1:1)
-    fns = (fetch_mt5, fetch_binance) if (mt5_only and asset == "BTCUSDT") else ((fetch_mt5,) if mt5_only else (fetch_mt5, fetch_binance, fetch_yahoo))
+    fns = (fetch_mt5, fetch_binance) if btc_fb else ((fetch_mt5,) if mt5_only else (fetch_mt5, fetch_binance, fetch_yahoo))
     for fn in fns:
         try:
             candles, ticker, source = fn(asset, tf)
             if len(candles) < 30:
                 raise RuntimeError("Quá ít nến (%d)" % len(candles))
-            off = broker_utc_offset(asset) if source.startswith("mt5:") else 0
+            off = broker_offset_or_utc(asset, "VWAP phiên") if source.startswith("mt5:") else 0
             last_c = candles[-1]
             prev_t = candles[-2]["t"] if len(candles) > 1 else 0
             # Chữ ký nến: nếu nến cuối chưa đổi OHLC (hoặc biến động < 1e-6) thì tái sử dụng kết quả chỉ báo đã tính
@@ -1645,18 +1692,81 @@ def vote_volume(ind, candles):
 
 
 # ---- 4 agent mở rộng: Khung lớn, Trạng thái thị trường, Mức giá & phiên, Cá Voi Volume ----
+BROKER_OFFSET_FILE = os.path.join(DATA_DIR, "broker_utc_offset.json")
+BROKER_OFFSET = {}          # {asset: {"off": int, "ts": epoch lần cuối xác nhận}}
+BROKER_OFFSET_LOCK = threading.Lock()
+_BROKER_OFFSET_WARNED = set()
+
+
+def load_broker_offsets():
+    try:
+        with open(BROKER_OFFSET_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return
+    with BROKER_OFFSET_LOCK:
+        for a, v in (raw or {}).items():
+            try:
+                off = int(v.get("off"))
+            except Exception:
+                continue
+            if a in ASSETS and -12 <= off <= 14:
+                BROKER_OFFSET[a] = {"off": off, "ts": float(v.get("ts") or 0)}
+
+
+def _remember_broker_offset(asset, off):
+    now = time.time()
+    with BROKER_OFFSET_LOCK:
+        old = BROKER_OFFSET.get(asset)
+        BROKER_OFFSET[asset] = {"off": off, "ts": now}
+        # chỉ ghi đĩa khi offset đổi (đổi giờ mùa hè/đông) hoặc mỗi giờ một lần
+        dirty = not old or old["off"] != off or now - old["ts"] > 3600
+        snap = dict(BROKER_OFFSET) if dirty else None
+    if old and old["off"] != off:
+        log("level_mapper", "🕒 Lệch giờ broker %s đổi từ UTC%+d sang UTC%+d." % (asset, old["off"], off), room="ta_room")
+    if snap is not None:
+        try:
+            tmp = BROKER_OFFSET_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(snap, f)
+            os.replace(tmp, BROKER_OFFSET_FILE)
+        except Exception as e:
+            print("save broker offset:", e)
+
+
 def broker_utc_offset(asset):
-    """Giờ nến MT5 là giờ server broker. Ước lượng lệch so với UTC (giờ) từ nến M5/M15 mới nhất."""
+    """Giờ nến MT5 là giờ server broker. Ước lượng lệch so với UTC (giờ) từ nến M5/M15 mới nhất.
+    Feed cũ/không đo được -> trả offset hợp lệ gần nhất (nhớ cả qua restart, lưu ở data/).
+    Chưa từng đo được -> trả None (KHÔNG âm thầm coi là UTC+0); người gọi tự quyết định."""
     with MT5_LOCK:
         feeds = [(MT5_FEED.get((asset, tf)), TF_SECONDS[tf]) for tf in ("5m", "15m")]
     for f, sec in feeds:
-        if not f or time.time() - f["ts"] > 600:
+        if not f or not f.get("candles") or time.time() - f["ts"] > 600:
             continue
         diff = f["candles"][-1]["t"] + sec / 2.0 - f["ts"]
         off = int(round(diff / 3600.0))
         if -12 <= off <= 14 and abs(diff - off * 3600) <= sec / 2.0 + 120:
+            _remember_broker_offset(asset, off)
             return off
+    with BROKER_OFFSET_LOCK:
+        last = BROKER_OFFSET.get(asset)
+    return last["off"] if last else None
+
+
+def broker_offset_or_utc(asset, who=""):
+    """Dùng cho chỉ báo/hiển thị khi vẫn phải tính tiếp: chưa biết offset thì tạm coi UTC nhưng CẢNH BÁO 1 lần."""
+    off = broker_utc_offset(asset)
+    if off is not None:
+        _BROKER_OFFSET_WARNED.discard(asset)
+        return off
+    if asset not in _BROKER_OFFSET_WARNED:
+        _BROKER_OFFSET_WARNED.add(asset)
+        log("level_mapper", "⚠️ Chưa đo được lệch giờ broker %s (feed M5/M15 cũ) → tạm coi giờ nến là UTC%s." % (
+            asset, " cho " + who if who else ""), room="ta_room")
     return 0
+
+
+load_broker_offsets()
 
 
 def htf_trend(asset, tf):
@@ -1780,7 +1890,7 @@ def current_session(ts=None):
 def price_levels(asset, ind, candles):
     """Đỉnh/đáy/mở cửa ngày trước & hôm nay (theo giờ nến MT5), vùng phiên Á (UTC), số tròn.
     major=True: mức mạnh, dùng cho luật "giá kẹt giữa hai mức"; mọi mức đều dùng để soi phản ứng giá."""
-    off = broker_utc_offset(asset)
+    off = broker_offset_or_utc(asset, "mức giá phiên Á")
     days = sorted(set(c["t"] // 86400 for c in candles))
     cur_day = days[-1]
     prev_days = [d for d in days if d < cur_day]
@@ -2005,6 +2115,29 @@ def quant_decision(asset, ind, votes, news_titles, skill_text, sentiment=0, ta=N
     return enforce_guards(decision, ta)
 
 
+def refresh_ticker_for_plan(asset, ind, analysis_ticker):
+    """Lấy lại tick MT5 mới nhất ngay trước khi tính entry/SL/TP (cuộc họp kéo dài vài chục giây, giá đã chạy).
+    Trả (ticker dùng cho risk_plan, ghi chú cảnh báo hoặc "")."""
+    stale = float(CONFIG.get("bridge_stale_sec") or 90)
+    with MT5_LOCK:
+        t = MT5_TICK.get(asset)
+        t = dict(t) if t else None
+    if not t or time.time() - t["ts"] >= stale:
+        if CONFIG.get("price_source", "mt5_only") == "mt5_only":
+            return analysis_ticker, "⚠️ Không lấy lại được tick MT5 mới (quá %ds) → entry/SL/TP theo giá lúc phân tích." % stale
+        return analysis_ticker, ""
+    live = dict(analysis_ticker or {})
+    live.update({"price": t["last"], "bid": t["bid"], "ask": t["ask"], "spread": t["spread"]})
+    ref = float(ind.get("price") or (analysis_ticker or {}).get("price") or 0.0)
+    a = float(ind.get("atr14") or 0.0)
+    drift = t["last"] - ref
+    if ref > 0 and a > 0 and abs(drift) > 0.5 * a:
+        d = ASSETS[asset]["decimals"]
+        return live, "⚠️ Giá đã chạy %+.*f (%.2f×ATR) từ lúc phân tích (%.*f → %.*f): kèo có thể đã trễ, cân nhắc chờ hồi." % (
+            d, drift, abs(drift) / a, d, ref, d, t["last"])
+    return live, ""
+
+
 def risk_plan(asset, action, ind, cfg, ticker=None):
     """Robot Quản Trị Vốn: SL = 1.5×ATR, TP1 = 1.8R, TP2 = 2.6R, Lot theo % rủi ro.
     Có bid/ask từ MT5 thì entry BUY = ask, SELL = bid (đúng giá khớp lệnh market)."""
@@ -2054,25 +2187,21 @@ def db_outcomes():
 
 
 def db_set_outcome(signal_id, outcome, source, detail="", exit_reason="", close_price=0.0, close_time="", net_profit=0.0, trigger_hooks=True):
+    """Ghi kết quả kèo. Không ghi đè cờ lesson_logged/telegram_alerted (chỉ đổi bằng UPDATE ... WHERE cờ=0)."""
     sid = int(signal_id)
-    prev_lesson, prev_tg, prev_reason = 0, 0, ""
+    new_reason = str(exit_reason or "")[:32]
     with DB_LOCK:
         conn = db_conn()
-        old = conn.execute("SELECT lesson_logged, telegram_alerted, exit_reason FROM signal_outcomes WHERE signal_id=?", (sid,)).fetchone()
-        if old:
-            prev_lesson = int(old["lesson_logged"] or 0)
-            prev_tg = int(old["telegram_alerted"] or 0)
-            prev_reason = str(old["exit_reason"] or "")
+        old = conn.execute("SELECT exit_reason FROM signal_outcomes WHERE signal_id=?", (sid,)).fetchone()
+        prev_reason = str(old["exit_reason"] or "") if old else ""
+        conn.execute("INSERT OR IGNORE INTO signal_outcomes (signal_id, outcome) VALUES (?, ?)", (sid, outcome))
+        conn.execute("""UPDATE signal_outcomes SET outcome=?, source=?, detail=?, evaluated_at=?, exit_reason=?,
+                        close_price=?, close_time=?, net_profit=? WHERE signal_id=?""",
+                     (outcome, source, str(detail or "")[:300], now_iso(), new_reason, float(close_price or 0.0),
+                      str(close_time or "")[:32], float(net_profit or 0.0), sid))
         # Nếu trạng thái nâng cấp từ TP1 (đang chạy) sang TP1+TP2 hoặc TP1+BE hoàn tất thì cho phép bắn thông báo cập nhật thêm 1 lần
-        new_reason = str(exit_reason or "")[:32]
         if prev_reason and prev_reason != new_reason and ("còn" in prev_reason or prev_reason == "TP1") and new_reason in ("TP1+TP2", "TP1+BE", "TP2"):
-            prev_tg = 0
-        conn.execute("""INSERT OR REPLACE INTO signal_outcomes
-            (signal_id, outcome, source, detail, evaluated_at, exit_reason, close_price, close_time, net_profit, lesson_logged, telegram_alerted)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                     (sid, outcome, source, str(detail or "")[:300], now_iso(),
-                      new_reason, float(close_price or 0.0),
-                      str(close_time or "")[:32], float(net_profit or 0.0), prev_lesson, prev_tg))
+            conn.execute("UPDATE signal_outcomes SET telegram_alerted=0 WHERE signal_id=?", (sid,))
         conn.commit()
         conn.close()
     if trigger_hooks and outcome in ("win", "loss"):
@@ -2082,14 +2211,39 @@ def db_set_outcome(signal_id, outcome, source, detail="", exit_reason="", close_
             print("on_signal_outcome_recorded error:", e)
 
 
+def signal_has_real_execution(conn, signal_id):
+    return conn.execute("""SELECT 1 FROM executions WHERE signal_id=? AND dry_run=0 AND ticket>0
+                           AND (error IS NULL OR error='') LIMIT 1""", (int(signal_id),)).fetchone() is not None
+
+
+def _claim_outcome_flag(sid, flag):
+    """Đặt cờ 0 -> 1 nguyên tử. True = luồng này giành được quyền xử lý (ghi bài học / gửi Telegram)."""
+    with DB_LOCK:
+        conn = db_conn()
+        cur = conn.execute("UPDATE signal_outcomes SET %s=1 WHERE signal_id=? AND %s=0" % (flag, flag), (sid,))
+        conn.commit()
+        n = cur.rowcount
+        conn.close()
+    return n == 1
+
+
+def _release_outcome_flag(sid, flag):
+    with DB_LOCK:
+        conn = db_conn()
+        conn.execute("UPDATE signal_outcomes SET %s=0 WHERE signal_id=?" % flag, (sid,))
+        conn.commit()
+        conn.close()
+
+
 def on_signal_outcome_recorded(signal_id):
     """Khi 1 kèo chạm SL hoặc TP:
-    1) Tự động phân tích hậu kiểm (ai bầu đúng/sai, bối cảnh Volume/Regime) và ghi vào bộ não SKILL.md.
-    2) Tự động bắn thông báo kèm ảnh biểu đồ kết quả sang Telegram."""
+    1) Kèo có lệnh khớp thật hoặc đã gửi Telegram: phân tích hậu kiểm và ghi vào bộ não SKILL.md.
+    2) Kèo đã gửi Telegram (telegram_sent=1): bắn thông báo kèm ảnh biểu đồ kết quả sang Telegram."""
     sid = int(signal_id)
     with DB_LOCK:
         conn = db_conn()
         oc_row = conn.execute("SELECT * FROM signal_outcomes WHERE signal_id=?", (sid,)).fetchone()
+        real_ex = signal_has_real_execution(conn, sid)
         conn.close()
     if not oc_row:
         return
@@ -2099,36 +2253,34 @@ def on_signal_outcome_recorded(signal_id):
     sig = db_get_signal(sid)
     if not sig:
         return
+    tg_sent = bool(int(sig.get("telegram_sent") or 0))
+    if not (real_ex or tg_sent):
+        return          # kèo chỉ nằm trên dashboard: không học, không báo
 
     # 1. Tự học hậu kiểm vào SKILL.md (chỉ ghi 1 lần khi kèo có kết quả)
-    if not int(oc.get("lesson_logged") or 0):
+    if not int(oc.get("lesson_logged") or 0) and _claim_outcome_flag(sid, "lesson_logged"):
         try:
             lesson_line = append_outcome_lesson(sig, oc)
-            with DB_LOCK:
-                conn = db_conn()
-                conn.execute("UPDATE signal_outcomes SET lesson_logged=1 WHERE signal_id=?", (sid,))
-                conn.commit()
-                conn.close()
             if lesson_line:
                 log("hermes_scribe", "🧠 Hậu kiểm kèo #%d (%s) → đã nạp bài học thực chiến vào %s." % (
                     sid, oc.get("exit_reason") or oc.get("outcome"), SKILL_FILES.get(sig["asset"], "SKILL.md")), room="library_room")
         except Exception as e:
+            _release_outcome_flag(sid, "lesson_logged")
             print("append_outcome_lesson error:", e)
 
-    # 2. Bắn thông báo chạm SL / TP sang Telegram (chỉ gửi 1 lần cho mỗi mốc kết quả)
-    if not int(oc.get("telegram_alerted") or 0) and CONFIG.get("telegram_alert_sl_tp", True):
+    # 2. Bắn thông báo chạm SL / TP sang Telegram (chỉ kèo đã gửi Telegram, 1 lần cho mỗi mốc kết quả)
+    if tg_sent and not int(oc.get("telegram_alerted") or 0) and CONFIG.get("telegram_alert_sl_tp", True) \
+            and _claim_outcome_flag(sid, "telegram_alerted"):
+        ok = False
         try:
             ok, msg = send_telegram_sl_tp_alert(CONFIG, sig, oc)
             if ok:
-                with DB_LOCK:
-                    conn = db_conn()
-                    conn.execute("UPDATE signal_outcomes SET telegram_alerted=1 WHERE signal_id=?", (sid,))
-                    conn.commit()
-                    conn.close()
                 log("vault_piggy", "📨 Đã báo Telegram kết quả kèo #%d chạm %s (%s)." % (
                     sid, oc.get("exit_reason") or oc.get("outcome"), msg), room="vault_room")
         except Exception as e:
             print("send_telegram_sl_tp_alert error:", e)
+        if not ok:
+            _release_outcome_flag(sid, "telegram_alerted")
 
 
 def _infer_exit_reason(action, open_price, close_price, sl, tp, comment="", raw_reason="", net_profit=0.0):
@@ -2292,11 +2444,11 @@ def executed_signals():
             FROM executions e JOIN signals s ON s.id = e.signal_id
             WHERE s.action IN ('BUY','SELL') AND e.dry_run = 0 AND e.ticket > 0 AND (e.error IS NULL OR e.error = '')
             ORDER BY e.id""").fetchall()
-        # Bổ sung cả các kèo BUY/SELL đã có kết quả trong signal_outcomes (kể cả chạy dry_run / dò nến) để AI tự học nhanh hơn
+        # Bổ sung các kèo BUY/SELL ĐÃ GỬI TELEGRAM có kết quả dò nến (kèo chỉ nằm trên dashboard không tính điểm)
         oc_rows = conn.execute("""SELECT s.id AS signal_id, s.asset, s.action, s.entry, s.stop_loss, s.take_profit_1,
                    s.take_profit_2, s.votes_json, s.created_at
             FROM signal_outcomes o JOIN signals s ON s.id = o.signal_id
-            WHERE s.action IN ('BUY','SELL') AND o.outcome IN ('win','loss')
+            WHERE s.action IN ('BUY','SELL') AND o.outcome IN ('win','loss') AND s.telegram_sent = 1
             ORDER BY s.id""").fetchall()
         conn.close()
     out = {}
@@ -2365,8 +2517,10 @@ def evaluate_signal_sl_tp(sig_dict, exs=None):
     if sl <= 0 or tp1 <= 0:
         return None
     buy = (action == "BUY")
-    off = broker_utc_offset(asset)
+    # Nến MT5 mang giờ broker: chưa từng đo được offset hợp lệ thì KHÔNG dò (dò lệch giờ = chấm SL/TP sai)
+    mt5_off = broker_utc_offset(asset)
     for tf in ("5m", "15m", "1h"):
+        off = mt5_off
         with MT5_LOCK:
             f = MT5_FEED.get((asset, tf))
             candles = list(f["candles"]) if f else []
@@ -2375,7 +2529,10 @@ def evaluate_signal_sl_tp(sig_dict, exs=None):
                 mc = MARKET_CACHE.get((asset, tf))
                 if mc and mc.get("all"):
                     candles = list(mc["all"])
-                    off = off if str(mc["data"].get("source", "")).startswith("mt5:") else 0
+                    if not str(mc["data"].get("source", "")).startswith("mt5:"):
+                        off = 0                      # Binance/Yahoo: giờ nến đã là UTC
+        if candles and off is None:
+            continue
         if not candles or candles[0]["t"] - off * 3600 > start:
             continue
         hit_tp1 = False
@@ -2444,6 +2601,8 @@ def check_open_signals_sl_tp():
     updated = 0
     for r in rows:
         sid = r["id"]
+        if broker_utc_offset(r["asset"]) is None and CONFIG.get("price_source", "mt5_only") == "mt5_only":
+            continue        # chưa từng có offset giờ broker hợp lệ -> chưa đánh giá được bằng nến MT5
         with DB_LOCK:
             conn = db_conn()
             exs = [dict(x) for x in conn.execute("SELECT * FROM executions WHERE signal_id=? ORDER BY id ASC", (sid,)).fetchall()]
@@ -2514,14 +2673,16 @@ def sl_tp_memory_block(asset=None, limit=8):
                        s.take_profit_1, s.indicators_json, s.votes_json, o.outcome, o.exit_reason, o.close_price,
                        o.close_time, o.net_profit, o.detail
                 FROM signal_outcomes o JOIN signals s ON s.id = o.signal_id
-                WHERE s.asset=? AND o.outcome IN ('win','loss')
+                WHERE s.asset=? AND o.outcome IN ('win','loss') AND (s.telegram_sent = 1 OR EXISTS (SELECT 1 FROM executions e WHERE e.signal_id = s.id AND e.dry_run = 0
+                       AND e.ticket > 0 AND (e.error IS NULL OR e.error = '')))
                 ORDER BY s.id DESC LIMIT ?""", (asset, int(limit))).fetchall()
         else:
             rows = conn.execute("""SELECT s.id, s.asset, s.timeframe, s.action, s.confidence, s.entry, s.stop_loss,
                        s.take_profit_1, s.indicators_json, s.votes_json, o.outcome, o.exit_reason, o.close_price,
                        o.close_time, o.net_profit, o.detail
                 FROM signal_outcomes o JOIN signals s ON s.id = o.signal_id
-                WHERE o.outcome IN ('win','loss')
+                WHERE o.outcome IN ('win','loss') AND (s.telegram_sent = 1 OR EXISTS (SELECT 1 FROM executions e WHERE e.signal_id = s.id AND e.dry_run = 0
+                       AND e.ticket > 0 AND (e.error IS NULL OR e.error = '')))
                 ORDER BY s.id DESC LIMIT ?""", (int(limit),)).fetchall()
         conn.close()
     if not rows:
@@ -3790,14 +3951,32 @@ def tg_api(cfg, method, params=None, timeout=35, file_tuple=None):
     return http_post_json(url, params or {}, timeout=timeout)
 
 
+def tg_owner_id(cfg):
+    return str(cfg.get("telegram_chat_id") or "").strip()
+
+
 def tg_allowed_chat(cfg, chat):
-    allow = [x.strip().lstrip("@").lower() for x in (cfg.get("telegram_news_chats") or "").split(",") if x.strip()]
-    if not allow:
-        return True
-    cid = str(chat.get("id", ""))
-    uname = str(chat.get("username", "")).lower()
-    title = str(chat.get("title", "")).lower()
-    return cid in allow or (uname and uname in allow) or (title and title in allow)
+    """Chỉ nhận chat có id trùng telegram_chat_id hoặc nằm trong telegram_news_chats (id / @username).
+    Danh sách trống -> không nhận gì. Không so theo title vì ai cũng đặt được title trùng."""
+    allow = set(x.strip().lstrip("@").lower() for x in (cfg.get("telegram_news_chats") or "").split(",") if x.strip())
+    owner = tg_owner_id(cfg)
+    if owner:
+        allow.add(owner.lstrip("@").lower())
+    if not allow or not isinstance(chat, dict):
+        return False
+    cid = str(chat.get("id", "")).strip()
+    uname = str(chat.get("username") or "").strip().lower()
+    return bool((cid and cid in allow) or (uname and uname in allow))
+
+
+def tg_forwarded_by_owner(cfg, msg):
+    """Tin forward chỉ được nhận khi người forward là telegram_chat_id (hoặc forward vào đúng chat đó)."""
+    owner = tg_owner_id(cfg)
+    if not owner:
+        return False
+    sender = str((msg.get("from") or {}).get("id", "")).strip()
+    chat_id = str((msg.get("chat") or {}).get("id", "")).strip()
+    return owner in (sender, chat_id)
 
 
 def tg_handle_update(cfg, upd):
@@ -3808,10 +3987,16 @@ def tg_handle_update(cfg, upd):
     if not text:
         return None
     chat = msg.get("chat", {})
-    fwd = msg.get("forward_from_chat") or msg.get("forward_origin", {}).get("chat")
-    src_chat = fwd or chat
-    if not tg_allowed_chat(cfg, src_chat) and not fwd:
+    origin = msg.get("forward_origin") or {}
+    is_fwd = bool(origin or msg.get("forward_from_chat") or msg.get("forward_from") or
+                  msg.get("forward_sender_name") or msg.get("forward_date"))
+    fwd = msg.get("forward_from_chat") or origin.get("chat") or origin.get("sender_chat")
+    if is_fwd:
+        if not tg_forwarded_by_owner(cfg, msg):
+            return None
+    elif not tg_allowed_chat(cfg, chat):
         return None
+    src_chat = fwd or chat
     # Bỏ qua tin do chính bot gửi (kèo) và lệnh /start
     if text.startswith("/") or text.startswith(("🟢 <b>", "🔴 <b>", "🟡 <b>")) or "Entry:" in text and "SL:" in text:
         return None
@@ -3821,7 +4006,7 @@ def tg_handle_update(cfg, upd):
     bear = sum(low.count(w) for w in BEAR_WORDS)
     item = {"title": text[:220].replace("\n", " "), "source": "Telegram:" + str(src_chat.get("title") or src_chat.get("username") or src_chat.get("id")),
             "url": "", "published": datetime.fromtimestamp(msg.get("date", time.time())).strftime("%H:%M %d/%m"),
-            "ts": msg.get("date", time.time()), "relevant": relevant, "sentiment": bull - bear, "forwarded": bool(fwd)}
+            "ts": msg.get("date", time.time()), "relevant": relevant, "sentiment": bull - bear, "forwarded": is_fwd}
     TG_NEWS.append(item)
     return item
 
@@ -3996,7 +4181,11 @@ def run_meeting(asset):
         pause()
         # ---- BƯỚC 5: Rủi ro -> Hermes ghi -> Heo lưu/Telegram (kèm ảnh biểu đồ) -> Party ----
         set_step(5, "Bước 5/5 · Duyệt rủi ro, ghi bài học, lưu kèo & chụp ảnh gửi Telegram")
-        plan = risk_plan(asset, decision["action"], ind, cfg, tk)
+        live_tk, drift_note = refresh_ticker_for_plan(asset, ind, tk)
+        plan = risk_plan(asset, decision["action"], ind, cfg, live_tk)
+        if drift_note:
+            plan["risk_note"] = drift_note + " " + plan["risk_note"]
+            log("risk_guard", drift_note, room="meeting_room")
         set_agent("risk_guard", bubble="SL %s · TP1 %s · Lot %s" % (plan["stop_loss"], plan["take_profit_1"], plan["lot_size"]))
         log("risk_guard", "🛡️ Entry %s | SL %s | TP1 %s | TP2 %s | Lot %.3f | %s" % (
             plan["entry"], plan["stop_loss"], plan["take_profit_1"], plan["take_profit_2"], plan["lot_size"], plan["risk_note"][:120]),
@@ -4144,8 +4333,18 @@ def market_refresh_loop():
 # ============================================================================
 # 10. HTTP SERVER
 # ============================================================================
+def qs_int(qs, key, default, lo=1, hi=200):
+    """Lấy tham số số nguyên từ query string, kẹp trong [lo, hi]; sai định dạng -> default."""
+    try:
+        v = int(float((qs.get(key) or [default])[0]))
+    except Exception:
+        v = default
+    return max(lo, min(hi, v))
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "AITradingOffice/1.0"
+    timeout = 20          # timeout socket mỗi kết nối: chặn client treo giữ luồng mãi
 
     def log_message(self, fmt, *args):
         if os.environ.get("OFFICE_HTTP_LOG") == "1":
@@ -4202,6 +4401,26 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 return False
         return False
+
+    def csrf_error(self, path):
+        """Chống CSRF cho POST của dashboard (không áp dụng EA_PATHS):
+        bắt buộc Content-Type application/json (form/text-plain cross-site bị chặn) và
+        Origin/Referer (nếu có) phải trùng Host. Trả (code, message) nếu vi phạm, None nếu hợp lệ."""
+        if path in EA_PATHS:
+            return None
+        ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if ctype != "application/json":
+            return 415, "Content-Type phải là application/json"
+        hosts = set(h.strip().lower() for h in ((self.headers.get("Host") or ""),
+                                                 (self.headers.get("X-Forwarded-Host") or "").split(",")[0]) if h.strip())
+        for hname in ("Origin", "Referer"):
+            val = (self.headers.get(hname) or "").strip()
+            if not val:
+                continue
+            netloc = urllib.parse.urlparse(val).netloc.lower() if val.lower() != "null" else ""
+            if not netloc or netloc not in hosts:
+                return 403, "%s không trùng Host" % hname
+        return None
 
     def deny(self):
         body = b'{"error": "unauthorized"}'
@@ -4283,8 +4502,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/news":
                 return self.send_json(fetch_news())
             if path == "/api/signals":
-                limit = int((qs.get("limit") or ["30"])[0])
-                return self.send_json(db_list_signals(min(limit, 200)))
+                return self.send_json(db_list_signals(qs_int(qs, "limit", 30)))
             if path == "/api/logs":
                 return self.send_json(list(LOGS))
             if path == "/api/config":
@@ -4312,13 +4530,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/bridge/status":
                 return self.send_json(mt5_status())
             if path == "/api/executions":
-                limit = int(qs.get("limit", ["50"])[0])
-                sid = int(qs.get("signal_id", ["0"])[0])
+                limit = qs_int(qs, "limit", 50)
+                sid = qs_int(qs, "signal_id", 0, lo=0, hi=2 ** 62)
                 only_ent = (qs.get("entered") or ["0"])[0] == "1"
-                return self.send_json(db_list_executions(min(limit, 500), sid or None, only_entered=only_ent))
+                return self.send_json(db_list_executions(limit, sid or None, only_entered=only_ent))
             if path == "/api/sl_tp_history":
-                limit = int(qs.get("limit", ["100"])[0])
-                return self.send_json(sl_tp_history(min(limit, 500)))
+                return self.send_json(sl_tp_history(qs_int(qs, "limit", 100)))
             if path == "/api/chart.png":
                 sid = int((qs.get("signal_id") or ["0"])[0])
                 sig = db_get_signal(sid) if sid > 0 else None
@@ -4350,7 +4567,12 @@ class Handler(BaseHTTPRequestHandler):
         path = u.path
         if not self.is_authorized(path):
             return self.deny()
+        bad = self.csrf_error(path)
+        if bad:
+            return self.send_json({"error": bad[1]}, bad[0])
         body = self.read_body()
+        if not isinstance(body, dict):
+            body = {}
         try:
             if path == "/api/meeting":
                 asset = str(body.get("asset", "XAUUSD")).upper()
@@ -4425,7 +4647,8 @@ class Handler(BaseHTTPRequestHandler):
                             v = max(0, min(95, int(v)))
                         except Exception:
                             continue
-                    if k in ("telegram_send_wait", "telegram_send_photo", "telegram_listen", "agent_auto_weight", "use_mt5_balance"):
+                    if k in ("telegram_send_wait", "telegram_send_photo", "telegram_listen", "agent_auto_weight", "use_mt5_balance",
+                             "telegram_alert_sl_tp", "btc_binance_fallback"):
                         v = v if isinstance(v, bool) else str(v).lower() in ("1", "true", "yes", "on")
                     if k == "quant_consensus":
                         try:
@@ -4578,7 +4801,14 @@ def main():
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     srv.daemon_threads = True
     if not ADMIN_PASSWORD:
-        print("⚠️  Chưa đặt OFFICE_ADMIN_PASSWORD: dashboard KHÔNG có mật khẩu, đừng mở cổng ra Internet.", flush=True)
+        if HOST in ("0.0.0.0", "", "::"):
+            print("\033[1;31m" + "!" * 78 + "\n"
+                  "!!  CẢNH BÁO: server bind %s:%d mà KHÔNG có OFFICE_ADMIN_PASSWORD.\n"
+                  "!!  Ai vào được cổng này đều xem/sửa cấu hình, API key, bật Auto-Pilot.\n"
+                  "!!  Đặt OFFICE_ADMIN_PASSWORD trong biến môi trường hoặc file .env cạnh server.py.\n"
+                  % (HOST or "*", PORT) + "!" * 78 + "\033[0m", flush=True)
+        else:
+            print("⚠️  Chưa đặt OFFICE_ADMIN_PASSWORD: dashboard KHÔNG có mật khẩu, đừng mở cổng ra Internet.", flush=True)
     print("🏢 AI Trading Office chạy tại http://%s:%d  (Ctrl+C để dừng)" % (HOST if HOST != "0.0.0.0" else "localhost", PORT), flush=True)
     try:
         srv.serve_forever()

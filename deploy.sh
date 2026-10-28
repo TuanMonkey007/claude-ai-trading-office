@@ -8,6 +8,9 @@
 #   ./deploy.sh --no-restart  # đẩy file nhưng không restart
 #   ./deploy.sh --setup-key   # cài SSH key (1 lần) để lần sau KHÔNG hỏi mật khẩu
 #
+# Dockerfile / docker-compose.yml / .dockerignore đổi → `docker compose up -d --build`
+# thay cho restart (restart không nạp image/cấu hình compose mới).
+#
 # SSH: script dùng ControlMaster nên dù chưa cài key cũng chỉ hỏi mật khẩu
 # MỘT lần cho mỗi lần chạy. Cài key bằng --setup-key để không hỏi nữa.
 #
@@ -30,7 +33,7 @@ for arg in "$@"; do
     --skills)     SKILLS_FORCE=1 ;;
     --no-restart) RESTART=0 ;;
     --setup-key)  SETUP_KEY=1 ;;
-    -h|--help)    sed -n '3,15p' "$0"; exit 0 ;;
+    -h|--help)    sed -n '3,18p' "$0"; exit 0 ;;
     *) echo "Tham số lạ: $arg (dùng --help)"; exit 2 ;;
   esac
 done
@@ -43,7 +46,8 @@ fi
 : "${SERVER_HOST:?Chưa đặt SERVER_HOST trong .deploy.env}"
 : "${SSH_PORT:=22}"
 : "${REMOTE_DIR:=/home/ai-office}"
-: "${HEALTH_URL:=http://127.0.0.1:8080/api/health}"
+# HEALTH_URL: để trống thì tự lấy APP_PORT trong .env trên server (cổng phía host).
+: "${HEALTH_URL:=}"
 : "${SYNC_SKILLS:=0}"
 [ "$SKILLS_FORCE" = 1 ] && SYNC_SKILLS=1
 
@@ -122,10 +126,24 @@ if [ "$RESTART" = 0 ]; then
   exit 0
 fi
 
-echo "→ Restart Docker compose trên server..."
-"${SSH[@]}" "cd '${REMOTE_DIR}' && { docker compose restart || docker compose up -d; }"
+if printf '%s\n' "$CHANGED" | grep -qE '[[:space:]](Dockerfile|docker-compose\.yml|\.dockerignore)$'; then
+  echo "→ Dockerfile/docker-compose.yml thay đổi → build lại image (docker compose up -d --build)..."
+  "${SSH[@]}" "cd '${REMOTE_DIR}' && docker compose up -d --build"
+else
+  echo "→ Restart Docker compose trên server..."
+  "${SSH[@]}" "cd '${REMOTE_DIR}' && { docker compose restart || docker compose up -d; }"
+fi
 
-echo "→ Health check..."
+if [ -z "$HEALTH_URL" ]; then
+  # Cổng phía host = APP_PORT trong .env trên server (compose: "${APP_PORT:-8080}:8080").
+  APP_PORT="$("${SSH[@]}" "grep -E '^[[:space:]]*APP_PORT=' '${REMOTE_DIR}/.env' 2>/dev/null | tail -n 1 | cut -d= -f2-" || true)"
+  APP_PORT="$(printf '%s' "$APP_PORT" | tr -d "\"' \r\t")"
+  APP_PORT="${APP_PORT%%#*}"
+  case "$APP_PORT" in ''|*[!0-9]*) APP_PORT=8080 ;; esac
+  HEALTH_URL="http://127.0.0.1:${APP_PORT}/api/health"
+fi
+
+echo "→ Health check: ${HEALTH_URL}"
 sleep 3
 if "${SSH[@]}" "curl -fsS '${HEALTH_URL}'" >/dev/null 2>&1; then
   echo "✅ Xong. Server đã chạy code mới."

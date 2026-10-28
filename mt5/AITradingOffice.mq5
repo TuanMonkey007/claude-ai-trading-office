@@ -19,8 +19,10 @@
 //     đặt EA DryRun=Tắt + EnableTrading=Bật.
 //
 //  KÈO "MỚI": EA nhớ id lớn nhất đã xử lý trong GlobalVariable
-//  "AITO_LastId_<magic>" nên restart terminal không đặt trùng.
-//  Muốn xử lý lại từ đầu: xoá biến đó trong Tools > Global Variables (F3).
+//  "AITO_LastId" (tên cố định, không phụ thuộc magic; bản cũ dùng
+//  "AITO_LastId_<magic>" và được gộp tự động) nên restart / đổi magic
+//  không đặt trùng. Ngoài ra EA còn dò lịch sử deal 24h theo comment AITO#id.
+//  Muốn xử lý lại từ đầu: xoá các biến đó trong Tools > Global Variables (F3).
 //
 //  ---------------------------------------------------------------
 //  MẪU JSON /api/signals?limit=5 mà parser phải đọc được (có object
@@ -51,8 +53,8 @@
 //  ---------------------------------------------------------------
 #property copyright "AI Trading Office"
 #property link      "https://github.com/"
-#property version   "1.30"
-#define  EA_VERSION  "1.30"
+#property version   "1.31"
+#define  EA_VERSION  "1.31"
 #property description "Cầu nối giá realtime + khớp lệnh (demo) cho AI Trading Office server"
 
 #include <Trade\Trade.mqh>
@@ -91,7 +93,7 @@ string   g_cfgSummary       = "chưa tải";
 
 //--- GLOBAL ----------------------------------------------------------
 CTrade   g_trade;
-string   g_gvLastId;            // tên GlobalVariable lưu id kèo cuối
+#define  GV_LASTID   "AITO_LastId"  // GlobalVariable lưu id kèo cuối (tên cố định, không theo magic)
 long     g_lastId   = 0;
 bool     g_haltDay  = false;    // đã chạm MaxDailyLossPercent hôm nay
 int      g_haltDayOfYear = -1;
@@ -119,6 +121,10 @@ int      g_lastBridgeCode = 200;
 string   g_lastBridgeErr  = "";
 datetime g_lastBridgeErrAt= 0;
 long     g_serverOffset   = 0;           // giờ server - giờ VPS (giây)
+datetime g_serverTimeAt   = 0;           // lần cuối đo được giờ server (giờ VPS); 0 = chưa có
+datetime g_noTimeWarnAt   = 0;           // lần cuối in cảnh báo thiếu giờ server
+string   g_modeAlert      = "";          // cảnh báo đổi DryRun/EnableTrading cho bảng điều khiển
+datetime g_modeAlertAt    = 0;
 // kèo mới nhất từ server
 long     g_sigId          = 0;
 string   g_sigAction      = "";
@@ -141,6 +147,7 @@ string   g_ticker         = "Khởi động EA...";
 // khoá 1 bản EA duy nhất trên terminal (gắn nhiều chart thì chỉ 1 bản làm việc)
 #define  LOCK_OWNER  "AITO_Owner"
 #define  LOCK_BEAT   "AITO_OwnerBeat"
+#define  LOCK_STALE_SEC 60              // nhịp tim cũ hơn -> bản khác tiếp quản (> timeout WebRequest dài nhất 30s)
 double   g_token          = 0;      // mã ngẫu nhiên của bản EA này
 bool     g_isMaster       = false;
 datetime g_lastFullPush   = 0;      // lần gửi đủ BridgeBars nến gần nhất
@@ -445,6 +452,51 @@ bool JsonSelfTest()
   }
 
 //+------------------------------------------------------------------+
+//| KHOÁ BẢN CHÍNH + ID KÈO ĐÃ XỬ LÝ (dùng chung GlobalVariable)       |
+//+------------------------------------------------------------------+
+long MaxL(long a, long b) { return (a > b) ? a : b; }
+
+// Ghi nhịp tim khoá nếu bản này đang giữ khoá (gọi trước/sau mỗi WebRequest dài)
+void LockBeat()
+  {
+   if(!g_isMaster) return;
+   if(GlobalVariableCheck(LOCK_OWNER) && GlobalVariableGet(LOCK_OWNER) == g_token)
+      GlobalVariableSet(LOCK_BEAT, (double)TimeLocal());
+  }
+
+// Kiểm tra trực tiếp (không throttle) bản này còn giữ khoá; còn thì ghi nhịp tim.
+// Không đổi g_isMaster ở đây: UpdateMasterLock() ở nhịp timer sau sẽ chuyển STANDBY.
+bool StillMaster()
+  {
+   if(!g_isMaster) return false;
+   if(!GlobalVariableCheck(LOCK_OWNER) || GlobalVariableGet(LOCK_OWNER) != g_token)
+     {
+      Print("[AITO] ⚠️ Bản EA này không còn là BẢN CHÍNH (bản khác đã tiếp quản) -> dừng xử lý kèo, không đặt lệnh.");
+      return false;
+     }
+   GlobalVariableSet(LOCK_BEAT, (double)TimeLocal());
+   return true;
+  }
+
+// g_lastId = max(g_lastId, AITO_LastId, AITO_LastId_<magic> của bản cũ)
+void SyncLastId()
+  {
+   if(GlobalVariableCheck(GV_LASTID)) g_lastId = MaxL(g_lastId, (long)GlobalVariableGet(GV_LASTID));
+   string legacy = "AITO_LastId_" + IntegerToString(MagicNumber);
+   if(GlobalVariableCheck(legacy)) g_lastId = MaxL(g_lastId, (long)GlobalVariableGet(legacy));
+  }
+
+// Ghi id kèo đã xử lý NGAY (không đợi hết vòng) + flush xuống đĩa
+void MarkProcessed(long id)
+  {
+   SyncLastId();
+   g_lastId = MaxL(g_lastId, id);
+   double gv = GlobalVariableCheck(GV_LASTID) ? GlobalVariableGet(GV_LASTID) : -1.0;
+   if((double)g_lastId > gv) GlobalVariableSet(GV_LASTID, (double)g_lastId);
+   GlobalVariablesFlush();
+  }
+
+//+------------------------------------------------------------------+
 //| HTTP                                                             |
 //+------------------------------------------------------------------+
 string BuildHeaders(bool isPost)
@@ -463,9 +515,11 @@ int HttpGet(const string url, string &body)
    string resHeaders;
    ArrayResize(data, 0);
    ResetLastError();
+   LockBeat();                     // WebRequest chặn tới WebTimeoutMs -> giữ khoá trước và sau
    ulong t0 = GetTickCount64();
    int code = WebRequest("GET", url, BuildHeaders(false), WebTimeoutMs, data, result, resHeaders);
    g_latencyMs = (long)(GetTickCount64() - t0);
+   LockBeat();
    if(code == 200) g_lastServerOk = TimeLocal();
    if(code == -1)
      {
@@ -488,9 +542,11 @@ int HttpPostJson(const string url, const string json, string &body, int timeoutM
    int len = StringToCharArray(json, data, 0, WHOLE_ARRAY, CP_UTF8);
    if(len > 0) ArrayResize(data, len - 1);   // bỏ ký tự NUL cuối
    ResetLastError();
+   LockBeat();
    ulong t0 = GetTickCount64();
    int code = WebRequest("POST", url, BuildHeaders(true), timeoutMs > 0 ? timeoutMs : WebTimeoutMs, data, result, resHeaders);
    g_latencyMs = (long)(GetTickCount64() - t0);
+   LockBeat();
    if(code == 200) g_lastServerOk = TimeLocal();
    if(code == -1)
      {
@@ -514,14 +570,29 @@ string MapAssetToSymbol(const string asset)
    return "";
   }
 
-double NormalizeLot(const string sym, double lot)
+// Làm tròn XUỐNG theo step, kẹp vmax. Lot < SYMBOL_VOLUME_MIN: chỉ nâng lên vmin khi rủi ro
+// thực tế ở vmin <= 1.5x rủi ro mục tiêu (riskLot = lot đúng RiskPercent; rủi ro tỉ lệ thuận
+// với lot nên tỉ lệ = vmin / riskLot). Không đạt -> trả 0 và lý do ra 'why' (bỏ kèo).
+double NormalizeLot(const string sym, double lot, double riskLot, string &why)
   {
+   why = "";
    double vmin  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
    double vmax  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
    double vstep = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
-   if(vstep <= 0) vstep = vmin > 0 ? vmin : 0.01;
+   if(vstep <= 0) vstep = (vmin > 0) ? vmin : 0.01;
+   double raw = lot;
    lot = MathFloor(lot / vstep + 1e-9) * vstep;
-   if(lot < vmin) lot = vmin;
+   if(lot < vmin - 1e-9)
+     {
+      double ratio = (riskLot > 0) ? vmin / riskLot : 0.0;
+      if(riskLot > 0 && ratio <= 1.5 + 1e-9)
+         lot = vmin;
+      else
+        {
+         why = StringFormat("lot %.4f < min %.2f; rủi ro ở min = %.2fx mục tiêu (> 1.5x)", raw, vmin, ratio);
+         return 0.0;
+        }
+     }
    if(vmax > 0 && lot > vmax) lot = vmax;
    // làm tròn theo số chữ số của step
    int digits = 0;
@@ -586,7 +657,15 @@ long SignalIdFromComment(const string comment)
    return StringToInteger(rest);
   }
 
-// Đếm số kèo (signal id khác nhau) đang mở trên symbol với magic của EA.
+// Vị thế đang được chọn có phải của EA: comment "AITO#" HOẶC magic hiện tại
+// (magic đổi từ server vẫn nhận ra lệnh cũ nhờ comment)
+bool IsEaPosition()
+  {
+   if(PositionGetInteger(POSITION_MAGIC) == MagicNumber) return true;
+   return StringFind(PositionGetString(POSITION_COMMENT), "AITO#") >= 0;
+  }
+
+// Đếm số kèo (signal id khác nhau) đang mở trên symbol của EA.
 // SplitTP tạo 2 vị thế cùng 1 kèo -> tính là 1.
 int CountOpenSignals(const string sym)
   {
@@ -597,7 +676,7 @@ int CountOpenSignals(const string sym)
      {
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0) continue;
-      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      if(!IsEaPosition()) continue;
       if(PositionGetString(POSITION_SYMBOL) != sym) continue;
       long sid = SignalIdFromComment(PositionGetString(POSITION_COMMENT));
       if(sid == 0) sid = -(long)ticket;      // broker xoá comment -> đếm riêng từng vị thế
@@ -613,15 +692,29 @@ int CountOpenSignals(const string sym)
    return ArraySize(ids);
   }
 
+// Kèo đã được vào lệnh chưa: vị thế đang mở (mọi magic, theo comment AITO#id)
+// hoặc deal vào lệnh trong 24h qua (bắt cả kèo đã đóng)
 bool SignalAlreadyOpen(long signalId)
   {
+   if(signalId <= 0) return false;
    int total = PositionsTotal();
    for(int i = 0; i < total; i++)
      {
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0) continue;
-      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
       if(SignalIdFromComment(PositionGetString(POSITION_COMMENT)) == signalId) return true;
+     }
+   datetime now = TimeCurrent();
+   if(HistorySelect(now - 86400, now + 3600))
+     {
+      int n = HistoryDealsTotal();
+      for(int i = n - 1; i >= 0; i--)
+        {
+         ulong d = HistoryDealGetTicket(i);
+         if(d == 0) continue;
+         if(HistoryDealGetInteger(d, DEAL_ENTRY) != DEAL_ENTRY_IN) continue;
+         if(SignalIdFromComment(HistoryDealGetString(d, DEAL_COMMENT)) == signalId) return true;
+        }
      }
    return false;
   }
@@ -629,26 +722,60 @@ bool SignalAlreadyOpen(long signalId)
 //+------------------------------------------------------------------+
 //| DAILY LOSS GUARD                                                  |
 //+------------------------------------------------------------------+
-// Lợi nhuận đã chốt hôm nay (theo giờ server broker) của các lệnh magic EA
-double RealizedToday()
+// Lãi/lỗ đã ghi vào balance hôm nay (theo giờ server broker) của các VỊ THẾ của EA, lọc giống
+// HandleHistoryRequest: vị thế có deal mang magic EA hoặc comment AITO# -> cộng MỌI deal hôm nay
+// của vị thế đó (cả deal đóng tay/SL có magic 0, commission ở deal vào, swap, DEAL_FEE).
+// Lùi 30 ngày để nhận ra vị thế mở từ trước. Cache 1.5s (UI + push_account gọi mỗi 2s).
+double   g_realizedCache = 0.0;
+ulong    g_realizedMs    = 0;
+
+bool PosIdInList(const long &ids[], long id)
   {
+   for(int i = ArraySize(ids) - 1; i >= 0; i--) if(ids[i] == id) return true;
+   return false;
+  }
+
+double RealizedToday(bool fresh = false)
+  {
+   ulong nowMs = GetTickCount64();
+   if(!fresh && g_realizedMs > 0 && nowMs - g_realizedMs < 1500) return g_realizedCache;
    datetime now = TimeCurrent();
    MqlDateTime dt;
    TimeToStruct(now, dt);
    dt.hour = 0; dt.min = 0; dt.sec = 0;
    datetime dayStart = StructToTime(dt);
-   if(!HistorySelect(dayStart, now + 60)) return 0.0;
-   double sum = 0.0;
+   if(!HistorySelect(dayStart - 30 * 86400, now + 3600)) return g_realizedCache;
    int total = HistoryDealsTotal();
+   long pids[];
+   ArrayResize(pids, 0);
    for(int i = 0; i < total; i++)
      {
       ulong d = HistoryDealGetTicket(i);
       if(d == 0) continue;
-      if(HistoryDealGetInteger(d, DEAL_MAGIC) != MagicNumber) continue;
-      long entry = HistoryDealGetInteger(d, DEAL_ENTRY);
-      if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_INOUT && entry != DEAL_ENTRY_OUT_BY) continue;
-      sum += HistoryDealGetDouble(d, DEAL_PROFIT) + HistoryDealGetDouble(d, DEAL_COMMISSION) + HistoryDealGetDouble(d, DEAL_SWAP);
+      long typ = HistoryDealGetInteger(d, DEAL_TYPE);
+      if(typ != DEAL_TYPE_BUY && typ != DEAL_TYPE_SELL) continue;
+      if(HistoryDealGetInteger(d, DEAL_MAGIC) != MagicNumber &&
+         StringFind(HistoryDealGetString(d, DEAL_COMMENT), "AITO#") < 0) continue;
+      long pid = HistoryDealGetInteger(d, DEAL_POSITION_ID);
+      if(pid <= 0 || PosIdInList(pids, pid)) continue;
+      int k = ArraySize(pids);
+      ArrayResize(pids, k + 1);
+      pids[k] = pid;
      }
+   double sum = 0.0;
+   for(int i = total - 1; i >= 0; i--)          // deal sắp theo thời gian -> lùi tới trước dayStart thì dừng
+     {
+      ulong d = HistoryDealGetTicket(i);
+      if(d == 0) continue;
+      if((datetime)HistoryDealGetInteger(d, DEAL_TIME) < dayStart) break;
+      long typ = HistoryDealGetInteger(d, DEAL_TYPE);
+      if(typ != DEAL_TYPE_BUY && typ != DEAL_TYPE_SELL) continue;
+      if(!PosIdInList(pids, HistoryDealGetInteger(d, DEAL_POSITION_ID))) continue;
+      sum += HistoryDealGetDouble(d, DEAL_PROFIT) + HistoryDealGetDouble(d, DEAL_COMMISSION) +
+             HistoryDealGetDouble(d, DEAL_SWAP) + HistoryDealGetDouble(d, DEAL_FEE);
+     }
+   g_realizedCache = sum;
+   g_realizedMs    = nowMs;
    return sum;
   }
 
@@ -660,7 +787,7 @@ double FloatingOfEA()
      {
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0) continue;
-      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      if(!IsEaPosition()) continue;
       sum += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
      }
    return sum;
@@ -678,7 +805,7 @@ bool DailyLossOk()
       Print("[AITO] Ngày mới, mở lại giao dịch.");
      }
    if(g_haltDay) return false;
-   double realized = RealizedToday();
+   double realized = RealizedToday(true);
    double floating = FloatingOfEA();
    double pnl = realized + floating;
    double balanceStart = AccountInfoDouble(ACCOUNT_BALANCE) - realized;
@@ -706,7 +833,7 @@ void ManageBreakEven()
      {
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0) continue;
-      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      if(!IsEaPosition()) continue;
       string comment = PositionGetString(POSITION_COMMENT);
       if(StringFind(comment, "/TP2") < 0) continue;
       long sid = SignalIdFromComment(comment);
@@ -717,7 +844,7 @@ void ManageBreakEven()
         {
          ulong t2 = PositionGetTicket(k);
          if(t2 == 0 || t2 == ticket) continue;
-         if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+         if(!IsEaPosition()) continue;
          string c2 = PositionGetString(POSITION_COMMENT);
          if(StringFind(c2, "/TP1") >= 0 && SignalIdFromComment(c2) == sid) { tp1Open = true; break; }
         }
@@ -797,6 +924,12 @@ ulong PlaceMarket(long signalId, const string sym, bool isBuy, double lot, doubl
   {
    error = ""; retcode = 0; fillPrice = 0;
    string action = isBuy ? "BUY" : "SELL";
+   // kèo có thể đã xử lý ở bản EA khác (vừa đổi bản chính) -> kiểm tra khoá ngay trước khi đặt
+   if(!StillMaster())
+     {
+      error = "not master";
+      return 0;
+     }
    double price = isBuy ? SymbolInfoDouble(sym, SYMBOL_ASK) : SymbolInfoDouble(sym, SYMBOL_BID);
    if(DryRun)
      {
@@ -811,6 +944,7 @@ ulong PlaceMarket(long signalId, const string sym, bool isBuy, double lot, doubl
    g_trade.SetTypeFillingBySymbol(sym);
    bool ok = isBuy ? g_trade.Buy(lot, sym, price, sl, tp, comment)
                    : g_trade.Sell(lot, sym, price, sl, tp, comment);
+   MarkProcessed(signalId);        // ghi lastId + flush NGAY sau khi gửi lệnh, trước WebRequest báo cáo
    retcode = (int)g_trade.ResultRetcode();
    bool done = ok && (retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_DONE_PARTIAL || retcode == TRADE_RETCODE_PLACED);
    ulong ticket = done ? g_trade.ResultOrder() : 0;
@@ -858,11 +992,17 @@ void ProcessSignal(const string obj, datetime serverNow)
       Print("[AITO] Bỏ qua ", tag, ": confidence < ", MinConfidence, ".");
       return;
      }
+   // tuổi kèo chỉ tính được khi có giờ server đáng tin (server_time của /api/ea/config)
+   if(serverNow <= 0)
+     {
+      Print("[AITO] Bỏ qua ", tag, ": chưa có giờ server đáng tin để tính tuổi kèo.");
+      return;
+     }
    datetime createdAt = ParseServerTime(created);
    long age = (createdAt > 0) ? (long)(serverNow - createdAt) : -1;
-   if(createdAt == 0 || age > MaxSignalAgeSec)
+   if(createdAt == 0 || age > MaxSignalAgeSec || age < -60)
      {
-      Print("[AITO] Bỏ qua ", tag, ": tuổi kèo ", age, "s > ", MaxSignalAgeSec, "s (created_at=", created, ").");
+      Print("[AITO] Bỏ qua ", tag, ": tuổi kèo ", age, "s ngoài [-60..", MaxSignalAgeSec, "]s (created_at=", created, ").");
       ReportExecution(id, MapAssetToSymbol(asset), action, 0, 0, 0, slSrv, tp1, 0, "skipped: stale " + IntegerToString(age) + "s", "");
       return;
      }
@@ -880,7 +1020,7 @@ void ProcessSignal(const string obj, datetime serverNow)
      }
    if(SignalAlreadyOpen(id))
      {
-      Print("[AITO] Bỏ qua ", tag, ": đã có vị thế của kèo này.");
+      Print("[AITO] Bỏ qua ", tag, ": đã có vị thế / deal vào lệnh (24h) của kèo này.");
       return;
      }
    int openCnt = CountOpenSignals(sym);
@@ -910,20 +1050,43 @@ void ProcessSignal(const string obj, datetime serverNow)
 
    bool   isBuy = (action == "BUY");
    int    digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   double point  = SymbolInfoDouble(sym, SYMBOL_POINT);
    double bid = SymbolInfoDouble(sym, SYMBOL_BID);
    double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
-   double mkt = isBuy ? ask : bid;
+   double mkt = isBuy ? ask : bid;            // giá khớp: ask khi BUY, bid khi SELL (phía bất lợi)
+   if(bid <= 0 || ask <= 0)
+     {
+      Print("[AITO] Bỏ qua ", tag, ": chưa có giá ", sym, ".");
+      return;
+     }
 
-   // SL/TP: giữ khoảng cách của server so với entry, áp lên giá thị trường hiện tại
-   double slDist  = MathAbs(entry - slSrv);
-   double tp1Dist = MathAbs(tp1 - entry);
-   double tp2Dist = MathAbs(tp2 - entry);
-   if(slDist <= 0 || tp1Dist <= 0)
+   // SL/TP của kèo phải đúng phía: BUY sl < entry < tp1, SELL sl > entry > tp1
+   bool sideOk = isBuy ? (slSrv < entry && entry < tp1) : (slSrv > entry && entry > tp1);
+   if(entry <= 0 || slSrv <= 0 || tp1 <= 0 || !sideOk)
      {
       Print("[AITO] Bỏ qua ", tag, ": SL/TP server không hợp lệ (entry=", entry, " sl=", slSrv, " tp1=", tp1, ").");
       ReportExecution(id, sym, action, 0, 0, mkt, slSrv, tp1, 0, "invalid sl/tp in signal", "");
       return;
      }
+   double slDist  = MathAbs(entry - slSrv);
+   double tp1Dist = MathAbs(tp1 - entry);
+   double tp2Dist = isBuy ? tp2 - entry : entry - tp2;     // <= 0 (thiếu/sai phía) -> không có TP2
+
+   // Giá lệch: giá khớp đã chạy theo hướng bất lợi (BUY cao hơn / SELL thấp hơn entry) quá
+   // 0.5 x khoảng SL, hoặc đã vượt TP1, hoặc đã chạm SL của kèo -> setup không còn -> bỏ kèo
+   double chase = isBuy ? mkt - entry : entry - mkt;
+   bool pastTp1 = isBuy ? (mkt >= tp1) : (mkt <= tp1);
+   bool slHit   = isBuy ? (bid <= slSrv) : (ask >= slSrv);
+   if(chase > 0.5 * slDist || pastTp1 || slHit)
+     {
+      string why = pastTp1 ? "đã vượt TP1" : (slHit ? "đã chạm SL của kèo" :
+                   StringFormat("lệch %s > 0.5 x SL %s", DoubleToString(chase, digits), DoubleToString(slDist, digits)));
+      Print("[AITO] Bỏ qua ", tag, ": giá ", DoubleToString(mkt, digits), " so với entry ", DoubleToString(entry, digits), " ", why, ".");
+      ReportExecution(id, sym, action, 0, 0, mkt, slSrv, tp1, 0, "skipped: price moved (" + why + ")", "");
+      return;
+     }
+
+   // SL/TP: giữ khoảng cách của server so với entry, áp lên giá thị trường hiện tại
    double sl   = isBuy ? mkt - slDist  : mkt + slDist;
    double tpA  = isBuy ? mkt + tp1Dist : mkt - tp1Dist;
    double tpB  = (tp2Dist > 0) ? (isBuy ? mkt + tp2Dist : mkt - tp2Dist) : 0.0;
@@ -931,46 +1094,71 @@ void ProcessSignal(const string obj, datetime serverNow)
    tpA = NormalizePrice(sym, tpA);
    tpB = NormalizePrice(sym, tpB);
 
-   // Lot
-   double lot = UseServerLot ? lotSrv : LotByRisk(sym, slDist);
-   if(lot <= 0)
+   // Ép stops level TRƯỚC khi tính lot: SL bị nới xa hơn thì lot phải tính theo khoảng mới
+   double s1 = sl, t1 = tpA;
+   bool stopsOk = AdjustStops(sym, isBuy, s1, t1);
+   double s2 = s1, t2 = tpB;                  // TP2 dùng đúng SL đã ép của TP1
+   if(stopsOk && tpB > 0) stopsOk = AdjustStops(sym, isBuy, s2, t2);
+   if(!stopsOk)
+     {
+      Print("[AITO] Bỏ qua ", tag, ": SL sai phía so với giá hiện tại.");
+      ReportExecution(id, sym, action, 0, 0, mkt, sl, tpA, 0, "sl on wrong side", "");
+      return;
+     }
+   double slEff = isBuy ? mkt - s1 : s1 - mkt;
+   if(slEff < slDist) slEff = slDist;
+   if(slEff > slDist + point / 2)
+      Print("[AITO] ", tag, ": SL nới do stops level ", DoubleToString(slDist, digits), " -> ",
+            DoubleToString(slEff, digits), ", tính lại lot theo khoảng mới.");
+
+   // Lot: theo RiskPercent của balance TÀI KHOẢN NÀY; UseServerLot cũng bị kẹp <= lot rủi ro
+   double riskLot = LotByRisk(sym, slEff);
+   double lot = riskLot;
+   if(UseServerLot)
+     {
+      lot = (lotSrv < riskLot) ? lotSrv : riskLot;
+      if(lotSrv > riskLot && riskLot > 0)
+         Print(StringFormat("[AITO] %s: lot server %.4f > lot rủi ro %.4f (%.2f%% balance) -> dùng %.4f",
+                            tag, lotSrv, riskLot, RiskPercent, lot));
+     }
+   if(lot <= 0 || riskLot <= 0)
      {
       Print("[AITO] Bỏ qua ", tag, ": lot tính ra <= 0.");
-      ReportExecution(id, sym, action, 0, 0, mkt, sl, tpA, 0, "lot <= 0", "");
+      ReportExecution(id, sym, action, 0, 0, mkt, s1, t1, 0, "lot <= 0", "");
       return;
      }
    double vmin = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
    bool split = SplitTP && tpB > 0 && (lot / 2.0) >= vmin;
    Print(StringFormat("[AITO] %s | giá %s | lot raw %.4f | SL %s | TP1 %s | TP2 %s | split=%s | tuổi %ds",
-                      tag, DoubleToString(mkt, digits), lot, DoubleToString(sl, digits),
-                      DoubleToString(tpA, digits), DoubleToString(tpB, digits), split ? "yes" : "no", (int)age));
+                      tag, DoubleToString(mkt, digits), lot, DoubleToString(s1, digits),
+                      DoubleToString(t1, digits), DoubleToString(t2, digits), split ? "yes" : "no", (int)age));
 
    string err; int rc; double fill;
+   string why1 = "", why2 = "";
    if(!split)
      {
-      double lotOne = NormalizeLot(sym, lot);
-      double slOne = sl, tpOne = tpA;
-      if(!AdjustStops(sym, isBuy, slOne, tpOne))
+      double lotOne = NormalizeLot(sym, lot, riskLot, why1);
+      if(lotOne <= 0)
         {
-         Print("[AITO] Bỏ qua ", tag, ": SL sai phía so với giá hiện tại.");
-         ReportExecution(id, sym, action, lotOne, 0, mkt, slOne, tpOne, 0, "sl on wrong side", "");
+         Print("[AITO] Bỏ qua ", tag, ": ", why1, ".");
+         ReportExecution(id, sym, action, 0, 0, mkt, s1, t1, 0, "skipped: " + why1, "");
          return;
         }
-      PlaceMarket(id, sym, isBuy, lotOne, slOne, tpOne, "AITO#" + IntegerToString(id), err, rc, fill);
+      PlaceMarket(id, sym, isBuy, lotOne, s1, t1, "AITO#" + IntegerToString(id), err, rc, fill);
       return;
      }
-   double l1 = NormalizeLot(sym, lot / 2.0);
-   double l2 = NormalizeLot(sym, lot - l1);
-   double s1 = sl, t1 = tpA;
-   double s2 = sl, t2 = tpB;
-   if(!AdjustStops(sym, isBuy, s1, t1) || !AdjustStops(sym, isBuy, s2, t2))
+   // split: mỗi nửa >= vmin (điều kiện split) nên không cần nâng lot
+   double l1 = NormalizeLot(sym, lot / 2.0, 0.0, why1);
+   double l2 = NormalizeLot(sym, lot - l1, 0.0, why2);
+   if(l1 <= 0 || l2 <= 0)
      {
-      Print("[AITO] Bỏ qua ", tag, ": SL sai phía so với giá hiện tại.");
-      ReportExecution(id, sym, action, l1 + l2, 0, mkt, sl, tpA, 0, "sl on wrong side", "");
+      string why = (l1 <= 0) ? why1 : why2;
+      Print("[AITO] Bỏ qua ", tag, ": chia lot TP1/TP2 lỗi: ", why, ".");
+      ReportExecution(id, sym, action, 0, 0, mkt, s1, t1, 0, "skipped: " + why, "");
       return;
      }
    ulong tk1 = PlaceMarket(id, sym, isBuy, l1, s1, t1, "AITO#" + IntegerToString(id) + "/TP1", err, rc, fill);
-   if(!DryRun && tk1 == 0)
+   if(tk1 == 0 && (!DryRun || err == "not master"))
      {
       Print("[AITO] Lệnh TP1 thất bại -> không đặt lệnh TP2 của ", tag);
       return;
@@ -981,6 +1169,24 @@ void ProcessSignal(const string obj, datetime serverNow)
 //+------------------------------------------------------------------+
 //| POLL                                                              |
 //+------------------------------------------------------------------+
+// Ghi nhận giờ server vừa đọc được -> g_serverOffset (bù nửa độ trễ request)
+void SetServerClock(datetime srv)
+  {
+   if(srv <= 0) return;
+   g_serverOffset = (long)(srv - TimeLocal()) + g_latencyMs / 2000;
+   g_serverTimeAt = TimeLocal();
+  }
+
+// Giờ server hiện tại; 0 nếu chưa có / quá lâu chưa đo lại (không đáng tin -> không vào lệnh)
+datetime ServerNow()
+  {
+   if(g_serverTimeAt <= 0) return 0;
+   long maxAge = (3 * ConfigRefreshSec > 300) ? 3 * ConfigRefreshSec : 300;
+   if((long)(TimeLocal() - g_serverTimeAt) > maxAge) return 0;
+   return (datetime)((long)TimeLocal() + g_serverOffset);
+  }
+
+// Dự phòng khi server_time trong /api/ea/config không có (server bản cũ)
 datetime FetchServerTime()
   {
    string body;
@@ -1002,26 +1208,32 @@ void PollSignals()
    string objs[];
    int n = JsonSplitArray(body, objs);
    if(n == 0) return;
-
-   // "bây giờ" theo đồng hồ server để tính tuổi kèo (tránh lệch múi giờ VPS/server)
-   datetime serverNow = FetchServerTime();
-   if(serverNow == 0) serverNow = TimeLocal();
-   else g_serverOffset = (long)(serverNow - TimeLocal());
    UiStoreLatestSignal(objs[0]);   // server trả DESC -> phần tử 0 là kèo mới nhất
 
-   // Server trả DESC theo id -> xử lý từ cũ đến mới
-   long maxId = g_lastId;
+   // "bây giờ" theo đồng hồ server để tính tuổi kèo (tránh lệch múi giờ VPS/server)
+   if(ServerNow() == 0) SetServerClock(FetchServerTime());
+   if(ServerNow() == 0)
+     {
+      if(TimeLocal() - g_noTimeWarnAt >= 300)
+        {
+         g_noTimeWarnAt = TimeLocal();
+         Print("[AITO] ⛔ Không có giờ server đáng tin (server_time / /api/health) -> tạm KHÔNG xử lý kèo.");
+         UiTicker("Thiếu giờ server -> tạm không xử lý kèo");
+        }
+      return;                      // không đánh dấu đã xử lý: lần poll sau có giờ thì xét lại (kèo cũ bị loại theo tuổi)
+     }
+
+   // Server trả DESC theo id -> xử lý từ cũ đến mới; ghi lastId ngay sau từng kèo
    for(int i = n - 1; i >= 0; i--)
      {
+      if(!StillMaster()) return;   // ghi nhịp tim khoá trong vòng xử lý; mất khoá thì dừng ngay
+      SyncLastId();                // bản khác có thể vừa xử lý kèo này
       long id = JsonGetInt(objs[i], "id");
       if(id <= g_lastId) continue;
-      ProcessSignal(objs[i], serverNow);
-      if(id > maxId) maxId = id;
-     }
-   if(maxId != g_lastId)
-     {
-      g_lastId = maxId;
-      GlobalVariableSet(g_gvLastId, (double)g_lastId);
+      datetime nowSrv = ServerNow();
+      if(nowSrv == 0) return;      // giờ server hết hạn giữa vòng -> để lần poll sau
+      ProcessSignal(objs[i], nowSrv);
+      MarkProcessed(id);
      }
   }
 
@@ -1037,6 +1249,57 @@ bool JsonGetBool(const string obj, const string key, bool def)
    return def;
   }
 
+// Kẹp giá trị cấu hình server vào [lo..hi]; cảnh báo khi giá trị áp dụng thay đổi (tránh spam mỗi phút)
+double ClampCfgD(const string name, double raw, double lo, double hi, double cur)
+  {
+   double v = raw;
+   if(v < lo) v = lo;
+   if(v > hi) v = hi;
+   if(v != raw && (v != cur || !g_cfgLoaded))
+      Print(StringFormat("[AITO] ⚠️ %s=%.2f từ server ngoài khoảng [%.2f..%.2f] -> dùng %.2f", name, raw, lo, hi, v));
+   return v;
+  }
+
+int ClampCfgI(const string name, long raw, int lo, int hi, int cur)
+  {
+   int v = (raw < lo) ? lo : ((raw > hi) ? hi : (int)raw);
+   if((long)v != raw && (v != cur || !g_cfgLoaded))
+      Print(StringFormat("[AITO] ⚠️ %s=%I64d từ server ngoài khoảng [%d..%d] -> dùng %d", name, raw, lo, hi, v));
+   return v;
+  }
+
+// Cảnh báo rõ ràng (log + bảng điều khiển) khi server đổi DryRun / EnableTrading
+void WarnModeChange(bool oldDry, bool oldTrade)
+  {
+   if(oldDry == DryRun && oldTrade == EnableTrading) return;
+   long   tmode = AccountInfoInteger(ACCOUNT_TRADE_MODE);
+   string acc   = (tmode == ACCOUNT_TRADE_MODE_REAL ? "TÀI KHOẢN THẬT" : (tmode == ACCOUNT_TRADE_MODE_DEMO ? "demo" : "contest"));
+   string hhmm  = TimeToString(TimeLocal(), TIME_MINUTES);
+   bool   live  = !DryRun && EnableTrading;
+   bool   wasLive = !oldDry && oldTrade;
+   string msg = "";
+   if(oldDry != DryRun)
+      msg = DryRun ? "server BẬT DryRun" : "server TẮT DryRun";
+   if(oldTrade != EnableTrading)
+     {
+      string sep = (msg != "") ? ", " : "server ";
+      string tr  = EnableTrading ? "BẬT EnableTrading" : "TẮT EnableTrading";
+      msg = msg + sep + tr;
+     }
+   string effect = live ? "EA SẼ ĐẶT LỆNH THẬT" : (wasLive ? "EA ngừng đặt lệnh" : "chưa đặt lệnh");
+   Print("[AITO] ==================================================");
+   Print("[AITO] ⚠️⚠️ ĐỔI CHẾ ĐỘ GIAO DỊCH TỪ SERVER: ", msg);
+   Print("[AITO] ⚠️⚠️ DryRun ", (oldDry ? "BẬT" : "TẮT"), " -> ", (DryRun ? "BẬT" : "TẮT"),
+         " | EnableTrading ", (oldTrade ? "BẬT" : "TẮT"), " -> ", (EnableTrading ? "BẬT" : "TẮT"),
+         " | ", effect, " | ", acc, " #", AccountInfoInteger(ACCOUNT_LOGIN));
+   Print("[AITO] ==================================================");
+   if(live && !wasLive)
+      Alert("[AITO] Server bật giao dịch: EA SẼ ĐẶT LỆNH trên ", acc, " #", AccountInfoInteger(ACCOUNT_LOGIN));
+   g_modeAlert   = "⚠ " + hhmm + " " + msg;          // UiText cắt còn 63 ký tự
+   g_modeAlertAt = TimeLocal();
+   UiTicker("⚠ " + msg + " -> " + effect);
+  }
+
 // Tải GET /api/ea/config, áp vào biến toàn cục. Trả về true nếu thành công.
 bool FetchServerConfig(bool verbose)
   {
@@ -1049,6 +1312,12 @@ bool FetchServerConfig(bool verbose)
      }
    long   oldMagic  = MagicNumber;
    string oldGold   = GoldSymbol, oldBtc = BtcSymbol;
+   bool   oldDry    = DryRun, oldTrade = EnableTrading;
+
+   // giờ server (cùng đồng hồ với created_at của kèo) -> g_serverOffset để tính tuổi kèo
+   datetime srvTime = ParseServerTime(JsonGetString(body, "server_time"));
+   if(srvTime > 0) SetServerClock(srvTime);
+   else if(verbose || !g_cfgLoaded) Print("[AITO] ⚠️ /api/ea/config không có server_time -> dùng /api/health khi poll kèo.");
 
    PollSeconds         = (int)JsonGetInt(body, "poll_seconds", PollSeconds);
    WebTimeoutMs        = (int)JsonGetInt(body, "web_timeout_ms", WebTimeoutMs);
@@ -1057,16 +1326,16 @@ bool FetchServerConfig(bool verbose)
    TickIntervalMs      = (int)JsonGetInt(body, "tick_interval_ms", TickIntervalMs);
    CandleIntervalSec   = (int)JsonGetInt(body, "candle_interval_sec", CandleIntervalSec);
    BridgeBars          = (int)JsonGetInt(body, "bridge_bars", BridgeBars);
-   MinConfidence       = (int)JsonGetInt(body, "min_confidence", MinConfidence);
+   MinConfidence       = ClampCfgI("min_confidence", JsonGetInt(body, "min_confidence", MinConfidence), 50, 95, MinConfidence);
    MaxSignalAgeSec     = (int)JsonGetInt(body, "max_signal_age_sec", MaxSignalAgeSec);
    GoldSymbol          = JsonGetString(body, "gold_symbol", GoldSymbol);
    BtcSymbol           = JsonGetString(body, "btc_symbol", BtcSymbol);
-   MaxOpenPerSymbol    = (int)JsonGetInt(body, "max_open_per_symbol", MaxOpenPerSymbol);
+   MaxOpenPerSymbol    = ClampCfgI("max_open_per_symbol", JsonGetInt(body, "max_open_per_symbol", MaxOpenPerSymbol), 1, 5, MaxOpenPerSymbol);
    UseServerLot        = JsonGetBool(body, "use_server_lot", UseServerLot);
-   RiskPercent         = JsonGetDouble(body, "risk_percent", RiskPercent);
+   RiskPercent         = ClampCfgD("risk_percent", JsonGetDouble(body, "risk_percent", RiskPercent), 0.1, 5.0, RiskPercent);
    SplitTP             = JsonGetBool(body, "split_tp", SplitTP);
    BreakEvenBufferPts  = (int)JsonGetInt(body, "breakeven_buffer_pts", BreakEvenBufferPts);
-   MaxDailyLossPercent = JsonGetDouble(body, "max_daily_loss_pct", MaxDailyLossPercent);
+   MaxDailyLossPercent = ClampCfgD("max_daily_loss_pct", JsonGetDouble(body, "max_daily_loss_pct", MaxDailyLossPercent), 0.0, 20.0, MaxDailyLossPercent);
    DryRun              = JsonGetBool(body, "dry_run", DryRun);
    EnableTrading       = JsonGetBool(body, "enable_trading", EnableTrading);
    MagicNumber         = JsonGetInt(body, "magic", MagicNumber);
@@ -1076,6 +1345,10 @@ bool FetchServerConfig(bool verbose)
    if(TickIntervalMs < 200) TickIntervalMs = 200;
    if(CandleIntervalSec < 5) CandleIntervalSec = 5;
    if(BridgeBars < 50) BridgeBars = 50;
+   // mỗi WebRequest phải ngắn hơn LOCK_STALE_SEC, nếu không bản standby tưởng bản chính chết
+   if(WebTimeoutMs < 1000) WebTimeoutMs = 1000;
+   if(WebTimeoutMs > 20000) WebTimeoutMs = 20000;
+   if(MagicNumber <= 0) MagicNumber = oldMagic;
 
    // áp dụng thay đổi
    if(GoldSymbol != oldGold || !g_cfgLoaded)
@@ -1084,10 +1357,12 @@ bool FetchServerConfig(bool verbose)
       if(!SymbolSelect(BtcSymbol, true)) Print("[AITO] ⚠️ Không tìm thấy symbol BTC ", BtcSymbol);
    if(MagicNumber != oldMagic || !g_cfgLoaded)
      {
+      if(MagicNumber != oldMagic)
+         Print("[AITO] Magic đổi ", oldMagic, " -> ", MagicNumber, ": lastId giữ nguyên (", GV_LASTID,
+               "), lệnh cũ vẫn được nhận theo comment AITO#.");
       g_trade.SetExpertMagicNumber((ulong)MagicNumber);
-      g_gvLastId = "AITO_LastId_" + IntegerToString(MagicNumber);
-      if(GlobalVariableCheck(g_gvLastId)) g_lastId = (long)GlobalVariableGet(g_gvLastId);
-      else GlobalVariableSet(g_gvLastId, 0.0);
+      SyncLastId();                // lastId theo tên cố định; gộp max với AITO_LastId_<magic> của bản cũ
+      MarkProcessed(g_lastId);
      }
    g_trade.SetDeviationInPoints((ulong)SlippagePoints);
    // timer chạy cố định UI_FRAME_MS; tick/poll được điều tiết trong OnTimer
@@ -1107,6 +1382,7 @@ bool FetchServerConfig(bool verbose)
                                DryRun ? "on" : "off", EnableTrading ? "on" : "off", RiskPercent, SplitTP ? "on" : "off");
    if(verbose || first) Print("[AITO] Cấu hình từ server: ", g_cfgSummary);
    if(first && DryRun) Print("[AITO] ⚠️ DryRun=true: chỉ in log, không đặt lệnh. Đổi trong Cài đặt trên web.");
+   WarnModeChange(oldDry, oldTrade);
    return true;
   }
 
@@ -1504,8 +1780,16 @@ void UiDraw()
    UiRect("md_bg", 10, y, W - 20, 50, CLR_CARD, live ? mc : CLR_LINE);
    UiRect("md_bd", 22, y + 10, 92, 30, mc);
    UiText("md_tx", 68, y + 25, mode, CLR_BG, 11, "Segoe UI Black", ANCHOR_CENTER);
-   UiText("md_d1", 126, y + 8, live ? "EA ĐƯỢC PHÉP ĐẶT LỆNH" : (DryRun ? "Chỉ ghi log, KHÔNG đặt lệnh" : "Khớp lệnh đang tắt"),
-          live ? CLR_RED : CLR_TEXT, 9, "Segoe UI Semibold");
+   // vừa đổi DryRun/EnableTrading từ server -> nhấp nháy cảnh báo 15 phút thay dòng mô tả
+   bool modeAlert = g_modeAlert != "" && (TimeLocal() - g_modeAlertAt) < 900;
+   string d1 = live ? "EA ĐƯỢC PHÉP ĐẶT LỆNH" : (DryRun ? "Chỉ ghi log, KHÔNG đặt lệnh" : "Khớp lệnh đang tắt");
+   color d1Clr = live ? CLR_RED : CLR_TEXT;
+   if(modeAlert)
+     {
+      d1 = g_modeAlert;
+      d1Clr = UiMix(live ? CLR_RED : CLR_AMBER, CLR_TEXT, pulse);
+     }
+   UiText("md_d1", 126, y + 8, d1, d1Clr, 9, "Segoe UI Semibold");
    string cur = AccountInfoString(ACCOUNT_CURRENCY);
    UiText("md_d2", 126, y + 27, "Lệnh mở " + IntegerToString(g_openCount) + "  ·  Hôm nay " +
           (g_pnlToday >= 0 ? "+" : "") + DoubleToString(g_pnlToday, 2) + " " + cur + "  ·  Rủi ro " + DoubleToString(RiskPercent, 1) + "%",
@@ -1536,12 +1820,14 @@ string DealReasonTxt(long r, const string cmt)
    return "MANUAL";
   }
 
-ulong    g_lastClosedDeal = 0;
+ulong    g_lastClosedDeal = 0;     // deal đóng mới nhất server ĐÃ NHẬN (chỉ tăng khi push_account 200)
+ulong    g_pendingClosedDeal = 0;  // deal mới nhất trong gói đang gửi; 0 = gói không có recent_closed
 datetime g_lastClosedScan = 0;
 
 string BuildRecentClosedJson()
   {
    datetime now = TimeCurrent();
+   g_pendingClosedDeal = 0;
    if(g_lastClosedScan != 0 && now - g_lastClosedScan < 6) return "[]";
    g_lastClosedScan = now;
    datetime from = now - 3 * 86400;
@@ -1608,8 +1894,9 @@ string BuildRecentClosedJson()
       if(d > maxDeal) maxDeal = d;
       added++;
      }
-   if(maxDeal > g_lastClosedDeal) g_lastClosedDeal = maxDeal;
-   else if(g_lastClosedDeal == 0 && n > 0) g_lastClosedDeal = HistoryDealGetTicket(n - 1);
+   // chưa ghi g_lastClosedDeal ở đây: gửi lỗi thì lần sau phải gửi lại các deal này
+   if(maxDeal > g_lastClosedDeal) g_pendingClosedDeal = maxDeal;
+   else if(g_lastClosedDeal == 0 && n > 0) g_pendingClosedDeal = HistoryDealGetTicket(n - 1);
    return "[" + arr + "]";
   }
 
@@ -1672,12 +1959,6 @@ string BuildAccountJson()
 //| LỊCH SỬ GIAO DỊCH THEO MAGIC (chỉ chạy khi dashboard yêu cầu)      |
 //+------------------------------------------------------------------+
 string DealTypeTxt(long t) { return t == DEAL_TYPE_BUY ? "buy" : (t == DEAL_TYPE_SELL ? "sell" : "other"); }
-
-bool PosIdInList(const long &ids[], long id)
-  {
-   for(int i = ArraySize(ids) - 1; i >= 0; i--) if(ids[i] == id) return true;
-   return false;
-  }
 
 void HandleHistoryRequest(const string req)
   {
@@ -1806,6 +2087,8 @@ void PushAccount()
       Print("[AITO] Gửi thông tin tài khoản lỗi code=", code, " ", StringSubstr(body, 0, 120));
    if(code == 200)
      {
+      if(g_pendingClosedDeal > g_lastClosedDeal) g_lastClosedDeal = g_pendingClosedDeal;
+      g_pendingClosedDeal = 0;
       string req = JsonGetRaw(body, "history_request");     // server chỉ gửi kèm khi bạn bấm xem thống kê
       if(StringLen(req) > 2 && req != "null") HandleHistoryRequest(req);
      }
@@ -1814,8 +2097,8 @@ void PushAccount()
 //+------------------------------------------------------------------+
 //| KHOÁ MỘT BẢN EA DUY NHẤT                                          |
 //+------------------------------------------------------------------+
-// Trả về true nếu bản này là bản chính. Bản chính ghi nhịp tim mỗi giây;
-// nếu nhịp tim cũ hơn 15s (bản chính bị gỡ / terminal treo) thì bản khác tiếp quản.
+// Trả về true nếu bản này là bản chính. Bản chính ghi nhịp tim mỗi giây và trước/sau mỗi
+// WebRequest; nếu nhịp tim cũ hơn LOCK_STALE_SEC (bản chính bị gỡ / terminal treo) thì bản khác tiếp quản.
 bool UpdateMasterLock()
   {
    ulong nowMs = GetTickCount64();
@@ -1827,11 +2110,12 @@ bool UpdateMasterLock()
    bool was = g_isMaster;
    if(owner == g_token)
       g_isMaster = true;
-   else if(owner == 0 || (double)TimeLocal() - beat > 15)
+   else if(owner == 0 || (double)TimeLocal() - beat > LOCK_STALE_SEC)
       g_isMaster = GlobalVariableSetOnCondition(LOCK_OWNER, g_token, owner);   // nguyên tử: chỉ 1 bản thắng
    else
       g_isMaster = false;
    if(g_isMaster) GlobalVariableSet(LOCK_BEAT, (double)TimeLocal());
+   if(g_isMaster && !was) SyncLastId();     // tiếp quản: lấy id kèo bản cũ đã xử lý
    if(g_isMaster != was)
      {
       UiDeleteAll();
@@ -1860,9 +2144,7 @@ void UiDrawStandby()
 //+------------------------------------------------------------------+
 int OnInit()
   {
-   g_gvLastId = "AITO_LastId_" + IntegerToString(MagicNumber);
-   if(GlobalVariableCheck(g_gvLastId)) g_lastId = (long)GlobalVariableGet(g_gvLastId);
-   else GlobalVariableSet(g_gvLastId, 0.0);
+   SyncLastId();                   // AITO_LastId (+ gộp AITO_LastId_<magic> của bản cũ)
    g_trade.SetExpertMagicNumber((ulong)MagicNumber);
    g_trade.SetDeviationInPoints((ulong)SlippagePoints);
    g_trade.SetAsyncMode(false);
@@ -1944,10 +2226,11 @@ void OnTimer()
    if(g_showPanel)
       UiDraw();
    else
-      Comment(StringFormat("AI Trading Office → %s\n%s\nKhớp lệnh: %s | lastId=%I64d\nCấu hình server (%s): %s",
+      Comment(StringFormat("AI Trading Office → %s\n%s\nKhớp lệnh: %s | lastId=%I64d\nCấu hình server (%s): %s%s",
               ServerUrl, (EnablePriceBridge ? g_bridgeStatus : "Bridge: TẮT"),
               (DryRun ? "DryRun (chỉ log)" : (EnableTrading ? "BẬT" : "TẮT")), g_lastId,
-              TimeToString(g_lastCfgFetch, TIME_MINUTES), g_cfgSummary));
+              TimeToString(g_lastCfgFetch, TIME_MINUTES), g_cfgSummary,
+              (g_modeAlert != "" && TimeLocal() - g_modeAlertAt < 900) ? "\n" + g_modeAlert : ""));
   }
 
 void OnTick()

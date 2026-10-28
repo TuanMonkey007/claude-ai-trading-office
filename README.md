@@ -67,7 +67,9 @@ Sau khi đã cài server lần đầu (xem [DEPLOY-CENTOS.md](DEPLOY-CENTOS.md))
 - Cấu hình host/đường dẫn trong `.deploy.env` (copy từ `.deploy.env.example`, đã bị `.gitignore`).
 - **Không bao giờ đẩy** `data/` (DB + `config.json` chứa key) hay `.env` (mật khẩu dashboard) — script tự loại trừ.
 - `skills/` mặc định **không** đẩy để giữ nhật ký tự học Hermes trên server; chỉ đẩy khi cần bằng `./deploy.sh --skills` (sẽ ghi đè).
-- Server cần có `rsync` (`yum install -y rsync` nếu thiếu). Sửa `server.py` phải restart container; sửa `skills/`/`data/config.json` thì không.
+- Server cần có `rsync` (`yum install -y rsync` nếu thiếu). Sửa `server.py` phải restart container; sửa `skills/`/`data/config.json` thì không. Đổi `Dockerfile`/`docker-compose.yml` thì script tự chạy `docker compose up -d --build`.
+- Health check tự lấy `APP_PORT` (cổng phía host) trong `.env` trên server; đặt `HEALTH_URL` trong `.deploy.env` nếu muốn ghi đè.
+- VPS Windows (NSSM): `./update-from-mac.sh` (commit + push + chạy `deploy-windows.ps1` trên VPS; IP/user VPS đặt trong `.deploy.env`). Cài service lần đầu bằng `setup-windows-service.ps1` (đọc `OFFICE_ADMIN_PASSWORD` từ `.env`, cổng native đặt bằng `-Port`, không đặt `OFFICE_PORT` trong `.env`).
 
 ## Biến môi trường
 

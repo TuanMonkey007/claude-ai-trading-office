@@ -7,8 +7,9 @@ data/
 __pycache__/
 *.pyc
 
-# Hệ điều hành / log / DB
-.DS_Store
+# Hệ điều hành / công cụ / log / DB (mọi cấp thư mục)
+**/.DS_Store
+**/.kilo/
 *.log
 office.db*
 *.tgz

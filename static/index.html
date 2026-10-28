@@ -164,6 +164,7 @@ table.gm .ord button{padding:1px 6px;font-size:10px;display:block;margin:1px 0}
 .toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#1d2742;border:1px solid var(--line);color:var(--text);padding:10px 16px;border-radius:10px;font-size:13px;z-index:60;opacity:0;transition:opacity .2s;pointer-events:none}
 .toast.show{opacity:1}
 .badge{background:var(--red);color:#fff;font-size:10px;border-radius:999px;padding:1px 6px;font-weight:700}
+@media(max-width:700px){header{position:static}}
 @media(max-width:1100px){.cols{grid-template-columns:1fr}.tickers{grid-template-columns:1fr}.ticker .stats{grid-template-columns:repeat(3,1fr)}.form{grid-template-columns:1fr}}
 </style>
 </head>
@@ -325,7 +326,7 @@ table.gm .ord button{padding:1px 6px;font-size:10px;display:block;margin:1px 0}
       <label class="full">Chụp màn hình biểu đồ kèo & gửi kèm lý do vào lệnh qua Telegram <select name="telegram_send_photo"><option value="true">Bật — Gửi ảnh biểu đồ nến + Volume VSA + VWAP/EMA + vùng SL/TP kèm lý do</option><option value="false">Tắt — Chỉ gửi tin nhắn chữ</option></select></label>
       <label class="full">Bắn thông báo + ảnh biểu đồ sang Telegram khi lệnh dính SL hoặc chạm TP <select name="telegram_alert_sl_tp"><option value="true">Bật — Báo ngay khi kèo chạm TP1 / TP2 / SL / BE kèm hậu kiểm AI</option><option value="false">Tắt</option></select></label>
       <label>Lắng nghe tin Telegram (bot đọc kênh/nhóm nó là admin, hoặc tin bạn forward cho bot) <select name="telegram_listen"><option value="true">Bật</option><option value="false">Tắt</option></select></label>
-      <label>Chỉ nghe các kênh (id/@username, phẩy; trống = tất cả) <input name="telegram_news_chats" placeholder="@kenh_tin_vang, -100123456"></label>
+      <label>Nghe thêm các kênh (id/@username, phẩy). Luôn nghe Chat ID ở trên + tin chính bạn forward; trống = không nghe kênh nào khác <input name="telegram_news_chats" placeholder="@kenh_tin_vang, -100123456"></label>
       <label class="full">CryptoCompare News API Key (tuỳ chọn, không có thì dùng RSS Yahoo/CoinDesk/CoinTelegraph) <input name="cryptocompare_api_key" type="password" placeholder="tuỳ chọn"></label>
       </div>
     </div>
@@ -342,9 +343,10 @@ table.gm .ord button{padding:1px 6px;font-size:10px;display:block;margin:1px 0}
       <div class="form">
       <div class="sec">Nguồn giá cho phân tích</div>
       <label class="full">Nguồn giá <select name="price_source"><option value="mt5_only">Chỉ MT5 (giá broker realtime). Mất giá MT5 thì KHÔNG họp, không bắn kèo</option><option value="auto">MT5, dự phòng Binance PAXG / Yahoo khi mất MT5</option></select></label>
+      <label class="full">Chế độ "Chỉ MT5": cho BTCUSDT dự phòng Binance khi MT5 chưa có BTC <select name="btc_binance_fallback"><option value="false">Tắt — BTC cũng chỉ lấy giá MT5 (khuyến nghị)</option><option value="true">Bật — MT5 chưa có nến BTC thì dùng Binance BTCUSDT</option></select></label>
       <div class="sec">Kết nối EA ↔ server</div>
       <label>Bridge Token (tuỳ chọn, bảo vệ endpoint /api/push_price) <input name="bridge_token" type="password" placeholder="tuỳ chọn"></label>
-      <label>Coi MT5 mất kết nối sau (giây) → tự về Binance <input name="bridge_stale_sec" type="number" min="10" step="10"></label>
+      <label>Coi MT5 mất kết nối sau (giây) <input name="bridge_stale_sec" type="number" min="10" step="10"></label>
       <div class="sec">Cấu hình EA (EA chỉ cần URL server, các mục dưới tự tải về EA mỗi phút)</div>
       <label>Symbol vàng trên broker <input name="ea_gold_symbol" placeholder="XAUUSDm"></label>
       <label>Symbol BTC trên broker (trống = BTC lấy từ Binance) <input name="ea_btc_symbol" placeholder="BTCUSDm"></label>
@@ -431,7 +433,7 @@ const api = async (path, opt) => { const r = await fetch(path, opt); return r.js
 const post = (path, body) => api(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})});
 let toastTimer; function toast(msg){ const t=$('#toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.remove('show'),3200); }
 const fmt = (v, d=2) => (v==null||isNaN(v)) ? '—' : Number(v).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
-const esc = s => String(s??'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const esc = s => String(s??'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 /* ===================================================================
    1. BẢN ĐỒ VĂN PHÒNG 1440x810
@@ -884,12 +886,12 @@ function renderAccount(a){ if(!a) return; lastAcct=a; const cur=a.currency||'';
   setKpi('acToday',a.ea_realized_today+a.ea_floating,cur,true); setKpi('acMg',a.margin,cur); setKpi('acFm',a.free_margin,cur);
   $('#acMl').textContent=a.margin>0?fmt(a.margin_level,0)+'%':'—'; $('#acMl').style.color=a.margin>0&&a.margin_level<200?'var(--red)':'';
   $('#acLev').textContent='1:'+a.leverage;
-  const tb=$('#posTable tbody'); const ps=a.positions||[];
-  tb.innerHTML=ps.length?ps.map(p=>{ const d=p.symbol.toUpperCase().includes('BTC')?2:(p.open<100?5:3); const isEa=p.magic===a.ea_magic;
-    return `<tr class="${isEa?'ea':''}"><td>${p.ticket}</td><td><b>${esc(p.symbol)}</b>${isEa?'<span class="tag-ea">EA</span>':''}</td>
-      <td style="color:${p.type==='BUY'?'var(--green)':'var(--red)'};font-weight:700">${p.type}</td><td>${fmt(p.volume,2)}</td>
+  const tb=$('#posTable tbody'); const ps=Array.isArray(a.positions)?a.positions:[];
+  tb.innerHTML=ps.length?ps.map(p=>{ const d=String(p.symbol||'').toUpperCase().includes('BTC')?2:(p.open<100?5:3); const isEa=p.magic===a.ea_magic;
+    return `<tr class="${isEa?'ea':''}"><td>${esc(p.ticket)}</td><td><b>${esc(p.symbol)}</b>${isEa?'<span class="tag-ea">EA</span>':''}</td>
+      <td style="color:${p.type==='BUY'?'var(--green)':'var(--red)'};font-weight:700">${esc(p.type)}</td><td>${fmt(p.volume,2)}</td>
       <td>${fmt(p.open,d)}</td><td>${fmt(p.current,d)}</td><td>${p.sl?fmt(p.sl,d):'—'}</td><td>${p.tp?fmt(p.tp,d):'—'}</td>
-      <td style="color:${p.profit>=0?'var(--green)':'var(--red)'};font-weight:700">${p.profit>=0?'+':''}${money(p.profit)}</td><td class="muted">${esc(p.comment)}</td></tr>`; }).join('')
+      <td style="color:${p.profit>=0?'var(--green)':'var(--red)'};font-weight:700">${p.profit>=0?'+':''}${esc(money(p.profit))}</td><td class="muted">${esc(p.comment)}</td></tr>`; }).join('')
     :'<tr><td colspan="10" class="muted" style="text-align:center;padding:14px">Không có lệnh đang mở</td></tr>';
   drawEquity(a.history||[], a.equity, cur); }
 function drawEquity(h,eqNow,cur){ const c=$('#eqChart'), g=c.getContext('2d'); const W=c.width=c.clientWidth*devicePixelRatio, H=c.height=120*devicePixelRatio; g.clearRect(0,0,W,H);
@@ -901,7 +903,7 @@ function drawEquity(h,eqNow,cur){ const c=$('#eqChart'), g=c.getContext('2d'); c
   const gr=g.createLinearGradient(0,0,0,H); gr.addColorStop(0,`rgba(${col},.35)`); gr.addColorStop(1,`rgba(${col},0)`); g.fillStyle=gr; g.fill();
   g.beginPath(); pts.forEach((v,i)=>i?g.lineTo(x(i),y(v)):g.moveTo(0,y(v))); g.strokeStyle=`rgb(${col})`; g.lineWidth=2*devicePixelRatio; g.stroke();
   if(bal.length>1){ g.setLineDash([5*devicePixelRatio,4*devicePixelRatio]); g.beginPath(); bal.forEach((v,i)=>i?g.lineTo(x(i),y(v)):g.moveTo(0,y(v))); g.strokeStyle='rgba(245,182,60,.8)'; g.lineWidth=1.2*devicePixelRatio; g.stroke(); g.setLineDash([]); }
-  const ch=pts[pts.length-1]-pts[0]; $('#acChg').innerHTML=`<span style="color:${up?'var(--green)':'var(--red)'}">${ch>=0?'+':''}${money(ch,cur)}</span> <span style="color:var(--accent)">- - balance</span>`; }
+  const ch=pts[pts.length-1]-pts[0]; $('#acChg').innerHTML=`<span style="color:${up?'var(--green)':'var(--red)'}">${ch>=0?'+':''}${esc(money(ch,cur))}</span> <span style="color:var(--accent)">- - balance</span>`; }
 function renderTicker(asset,m){
   const el=document.getElementById('tk-'+asset); if(!el||!m.ticker) return;
   const tk=m.ticker, ind=m.indicators||{}; const d=asset==='XAUUSD'?2:1;
@@ -943,7 +945,7 @@ function slTpBadgeHtml(s){
   let badge='', detail='', border='var(--muted)';
   if(oc){
     const r=(oc.exit_reason||'').toUpperCase();
-    const pnl=oc.net_profit?` (${oc.net_profit>0?'+':''}${money(oc.net_profit,'USD')})`:'';
+    const pnl=oc.net_profit?` (${oc.net_profit>0?'+':''}${esc(money(oc.net_profit,'USD'))})`:'';
     if(r.includes('TP2')){ badge=`🏆 CHẠM ${esc(oc.exit_reason)}${pnl}`; border='var(--green)'; }
     else if(r.includes('TP')){ badge=`🎯 CHẠM ${esc(oc.exit_reason)}${pnl}`; border='var(--green)'; }
     else if(r==='BE'){ badge=`🛡️ HOÀ VỐN (BE)${pnl}`; border='var(--blue)'; }
@@ -955,7 +957,7 @@ function slTpBadgeHtml(s){
   const exLines=exs.map(e=>{
     const st=e.status==='closed'?`<b style="color:${(e.profit||0)>=0?'var(--green)':'var(--red)'}">[${esc(e.exit_reason||'ĐÓNG')} @${fmt(e.close_price,2)} · ${(e.profit||0)>=0?'+':''}${fmt(e.profit,2)}$]</b>`:
              (e.dry_run?'<span class="muted">[DryRun]</span>':'<span style="color:var(--accent)">[Đang mở]</span>');
-    return `${e.ticket?'#'+e.ticket:'DryRun'} ${esc(e.symbol)} ${fmt(e.volume,2)} lot @${fmt(e.price,2)} ${st}`;
+    return `${e.ticket?'#'+esc(e.ticket):'DryRun'} ${esc(e.symbol)} ${fmt(e.volume,2)} lot @${fmt(e.price,2)} ${st}`;
   }).join(' &nbsp;·&nbsp; ');
   if(!badge && !exLines) return '';
   return `<div class="arg" style="border-left:3px solid ${border};display:flex;flex-direction:column;gap:3px">
@@ -983,8 +985,8 @@ async function loadSlTpHistory(){
       }
       const pnl=e.status==='closed'?`<span style="color:${(e.profit||0)>=0?'var(--green)':'var(--red)'};font-weight:700">${(e.profit||0)>=0?'+':''}${fmt(e.profit,2)}$</span>`:'—';
       return `<tr>
-        <td><b>#${e.signal_id||'—'}</b></td>
-        <td>${e.ticket||'Dry'}</td>
+        <td><b>#${esc(e.signal_id||'—')}</b></td>
+        <td>${esc(e.ticket||'Dry')}</td>
         <td><b>${esc(e.symbol)}</b></td>
         <td style="color:${e.action==='BUY'?'var(--green)':'var(--red)'};font-weight:700">${esc(e.action)}</td>
         <td>${fmt(e.volume,2)}</td>
@@ -1002,10 +1004,10 @@ async function loadSignals(){
   try{ const sigs=await api('/api/signals?limit=20'); $('#sigCount').textContent=sigs.length;
     loadSlTpHistory();
     if(!sigs.length){ $('#signals').innerHTML='<div class="empty">Chưa có kèo nào. Bấm "Họp Kèo" để bắt đầu.</div>'; return; }
-    $('#signals').innerHTML=sigs.map(s=>{ const d=s.asset==='XAUUSD'?2:1; return `<div class="sig ${s.action}">
-      <div class="top"><span class="act ${s.action}">${s.action}</span><span class="conf">${s.confidence}%</span><b>${esc(s.asset)}</b><span style="color:var(--muted)">${esc(s.timeframe)}</span><a href="/api/chart.png?signal_id=${s.id}" target="_blank" class="btn-ghost sm" style="padding:2px 7px;font-size:11px;text-decoration:none" title="Xem ảnh chụp biểu đồ kèo">📸 Ảnh kèo</a><span class="meta">#${s.id} · ${esc(s.created_at)}${s.telegram_sent?' · 📨':''} · ${esc(s.llm_provider)}</span></div>
-      <div class="grid4"><div><b>Entry</b>${fmt(s.entry,d)}</div><div><b>Stop Loss</b>${fmt(s.stop_loss,d)}</div><div><b>TP1 (1:${s.rr1})</b>${fmt(s.take_profit_1,d)}</div><div><b>TP2 (1:${s.rr2})</b>${fmt(s.take_profit_2,d)}</div></div>
-      <div class="grid4"><div><b>Lot</b>${fmt(s.lot_size,3)}</div><div><b>Rủi ro $</b>${fmt(s.risk_amount,2)}</div><div><b>RSI</b>${fmt(s.indicators.rsi14,1)}</div><div><b>Phiếu</b>${votesHtml(s.votes)}</div></div>
+    $('#signals').innerHTML=sigs.map(s=>{ const d=s.asset==='XAUUSD'?2:1; const act=esc(s.action); return `<div class="sig ${act}">
+      <div class="top"><span class="act ${act}">${act}</span><span class="conf">${esc(s.confidence)}%</span><b>${esc(s.asset)}</b><span style="color:var(--muted)">${esc(s.timeframe)}</span><a href="/api/chart.png?signal_id=${encodeURIComponent(s.id)}" target="_blank" class="btn-ghost sm" style="padding:2px 7px;font-size:11px;text-decoration:none" title="Xem ảnh chụp biểu đồ kèo">📸 Ảnh kèo</a><span class="meta">#${esc(s.id)} · ${esc(s.created_at)}${s.telegram_sent?' · 📨':''} · ${esc(s.llm_provider)}</span></div>
+      <div class="grid4"><div><b>Entry</b>${fmt(s.entry,d)}</div><div><b>Stop Loss</b>${fmt(s.stop_loss,d)}</div><div><b>TP1 (1:${esc(s.rr1)})</b>${fmt(s.take_profit_1,d)}</div><div><b>TP2 (1:${esc(s.rr2)})</b>${fmt(s.take_profit_2,d)}</div></div>
+      <div class="grid4"><div><b>Lot</b>${fmt(s.lot_size,3)}</div><div><b>Rủi ro $</b>${fmt(s.risk_amount,2)}</div><div><b>RSI</b>${fmt((s.indicators||{}).rsi14,1)}</div><div><b>Phiếu</b>${votesHtml(s.votes)}</div></div>
       ${slTpBadgeHtml(s)}
       ${taHtml(s.indicators&&s.indicators.ta, s.asset)}
       <div class="arg sum">⚖️ <b>Trưởng nhóm:</b> ${esc(s.summary)}</div>
@@ -1020,7 +1022,7 @@ async function loadSignals(){
 let currentSkill=null, lastSkillContent={};
 async function loadSkillList(){
   try{ const list=await api('/api/skills'); const bar=$('#skillsBar');
-    bar.innerHTML=list.map(f=>`<button class="btn-ghost ${f.name===currentSkill?'active':''}" data-f="${esc(f.name)}" title="${f.modified}">${esc(f.name.replace('.md',''))}</button>`).join('');
+    bar.innerHTML=list.map(f=>`<button class="btn-ghost ${f.name===currentSkill?'active':''}" data-f="${esc(f.name)}" title="${esc(f.modified)}">${esc(f.name.replace('.md',''))}</button>`).join('');
     bar.querySelectorAll('button').forEach(b=>b.onclick=()=>{currentSkill=b.dataset.f; loadSkillList(); loadSkill(currentSkill);});
     if(!currentSkill&&list.length){ currentSkill=list[0].name; loadSkillList(); loadSkill(currentSkill);} }catch(e){}
 }
@@ -1054,8 +1056,8 @@ async function poll(){
     $('#stepDot').className='dot err';
   }
 }
-function startPoll(){ pollTimer = setInterval(poll, POLL_INTERVAL); }
-function stopPoll(){ if(pollTimer) clearInterval(pollTimer); }
+function stopPoll(){ if(pollTimer){ clearInterval(pollTimer); pollTimer=null; } }
+function startPoll(){ stopPoll(); poll(); pollTimer = setInterval(poll, POLL_INTERVAL); }   // xoá timer cũ, gọi ngay 1 lần
 document.addEventListener('visibilitychange', () => document.hidden ? stopPoll() : startPoll());
 startPoll();
 loadSignals(); loadSkillList(); setInterval(()=>{loadSignals(); loadSkillList(); loadSkill(currentSkill);},15000);
@@ -1077,21 +1079,27 @@ $('#btnStats').onclick=()=>{ const t=new Date(); if(!$('#stMagic').value) $('#st
 $('#stClose').onclick=()=>stModal.classList.remove('show'); stModal.onclick=e=>{ if(e.target===stModal) stModal.classList.remove('show'); };
 function setStatus(html,cls){ const e=$('#stStatus'); e.className='st-status '+(cls||''); e.innerHTML=html; }
 $('#stGo').onclick=async()=>{ const [f,t]=rangeDates($('#stRange').value); const magic=+$('#stMagic').value||0;
-  const r=await post('/api/stats/request',{magic,from:mt(ymd(f)),to:mt(ymd(t))}); if(!r.ok) return setStatus('❌ '+(r.error||'lỗi'),'err');
+  let r; try{ r=await post('/api/stats/request',{magic,from:mt(ymd(f)),to:mt(ymd(t))}); }catch(e){ return setStatus('❌ Không gửi được yêu cầu: '+esc(e.message),'err'); }
+  if(!r.ok) return setStatus('❌ '+esc(r.error||'lỗi'),'err');
   if(!r.ea_online) setStatus('⚠️ EA đang offline: yêu cầu sẽ được xử lý khi EA kết nối lại (tối đa 5 phút).','err');
   if(r.ea_online && !r.ea_version) setStatus('⚠️ EA trên VPS là bản cũ, chưa hỗ trợ thống kê. Chép mt5/AITradingOffice.mq5 mới, bấm F7 rồi thử lại.','err');
-  $('#stGo').disabled=true; const t0=Date.now();
-  while(Date.now()-t0<90000){ await new Promise(x=>setTimeout(x,1000)); const st=await api('/api/stats/result?id='+r.id);
-    if(st.status==='done'){ $('#stGo').disabled=false; stData=st.result; renderStats(); const sm=stData.summary;
-      return setStatus(`✅ Nhận ${sm.deals} deal của magic <b>${stData.magic||'tất cả'}</b> từ <b>${stData.from}</b> đến <b>${stData.to}</b> (giờ server broker)${sm.truncated?' · ⚠ đã cắt bớt, chỉ 5.000 deal đầu':''}`,'ok'); }
-    if(st.status==='error'){ $('#stGo').disabled=false; return setStatus('❌ '+st.error,'err'); }
+  $('#stGo').disabled=true; const t0=Date.now(); let netErr=0;
+  try{
+  while(Date.now()-t0<90000){ await new Promise(x=>setTimeout(x,1000)); let st;
+    try{ st=await api('/api/stats/result?id='+encodeURIComponent(r.id)); netErr=0; }
+    catch(e){ if(++netErr>=5) return setStatus('❌ Mất kết nối server khi chờ kết quả thống kê: '+esc(e.message),'err'); continue; }
+    if(st.status==='done'){ stData=st.result; renderStats(); const sm=stData.summary;
+      return setStatus(`✅ Nhận ${esc(sm.deals)} deal của magic <b>${esc(stData.magic||'tất cả')}</b> từ <b>${esc(stData.from)}</b> đến <b>${esc(stData.to)}</b> (giờ server broker)${sm.truncated?' · ⚠ đã cắt bớt, chỉ 5.000 deal đầu':''}`,'ok'); }
+    if(st.status==='error') return setStatus('❌ '+esc(st.error),'err');
+    if(st.status==='missing') return setStatus('❌ Server không còn yêu cầu này (có yêu cầu mới hơn hoặc server vừa khởi động lại). Bấm lại để thử.','err');
     let msg;
     if(!st.picked) msg=st.waited>10?'EA chưa lấy yêu cầu. EA có đang ONLINE và gửi số dư không?':'Đang chờ EA trên VPS nhận yêu cầu...';
     else if(!st.acked) msg=st.since_pick>8?'⚠ Server đã chuyển yêu cầu nhưng EA không xác nhận: EA trên VPS là bản cũ. Chép bản mới, F7 rồi thử lại.':'Đã chuyển yêu cầu cho EA, chờ EA xác nhận...';
     else msg='EA đã xác nhận, đang đọc và gửi lịch sử giao dịch...'+(st.tries>1?` (lần ${st.tries})`:'');
     if(st.ea_error) msg+=`<br><span style="color:var(--red)">Lỗi lần trước: ${esc(st.ea_error)}</span>`;
-    setStatus(`<span class="spin"></span>${msg} (${st.waited}s)`, (st.picked&&!st.acked&&st.since_pick>8)?'err':''); }
-  $('#stGo').disabled=false; setStatus('❌ Quá 90 giây EA không trả lời. Kiểm tra EA trên VPS đã cập nhật bản mới và đang ONLINE.','err'); };
+    setStatus(`<span class="spin"></span>${msg} (${esc(st.waited)}s)`, (st.picked&&!st.acked&&st.since_pick>8)?'err':''); }
+  setStatus('❌ Quá 90 giây EA không trả lời. Kiểm tra EA trên VPS đã cập nhật bản mới và đang ONLINE.','err');
+  } finally { $('#stGo').disabled=false; } };
 function moneyS(v,cur){ return (v>0?'+':'')+money(v,cur); }
 function renderStats(){ const d=stData, s=d.summary, c=s.currency; $('#stResult').hidden=false;
   const col=v=>v>0?'var(--green)':v<0?'var(--red)':'';
@@ -1102,15 +1110,15 @@ function renderStats(){ const d=stData, s=d.summary, c=s.currency; $('#stResult'
     ['Lệnh lãi lớn nhất',moneyS(s.best,c),'var(--green)'],['Lệnh lỗ lớn nhất',moneyS(s.worst,c),'var(--red)'],['Chuỗi thua dài nhất',s.max_loss_streak+' lệnh',''],
     ['Số dư đầu kỳ',money(s.start_balance,c),''],['Số dư cuối kỳ',money(s.end_balance,c),''],['Recovery factor',s.recovery_factor??'—',''],
     ['Lãi gộp',moneyS(s.gross_profit,c),'var(--green)'],['Lỗ gộp',moneyS(s.gross_loss,c),'var(--red)'],['Số dư hiện tại',money(s.balance_now,c),'']];
-  $('#stKpis').innerHTML=k.map(([a,b,cl])=>`<div class="kpi"><b>${a}</b><span style="color:${cl}">${b}</span></div>`).join('');
+  $('#stKpis').innerHTML=k.map(([a,b,cl])=>`<div class="kpi"><b>${a}</b><span style="color:${cl}">${esc(b)}</span></div>`).join('');
   drawCurve(); drawBars();
-  const row=g=>`<tr><td><b>${esc(g.key)}</b></td><td>${g.trades}</td><td>${g.trades?Math.round(g.wins/g.trades*100):0}%</td><td style="color:${col(g.net)};font-weight:700">${moneyS(g.net,c)}</td></tr>`;
+  const row=g=>`<tr><td><b>${esc(g.key)}</b></td><td>${esc(g.trades)}</td><td>${g.trades?Math.round(g.wins/g.trades*100):0}%</td><td style="color:${col(g.net)};font-weight:700">${esc(moneyS(g.net,c))}</td></tr>`;
   const hd='<thead><tr><th></th><th>Lệnh</th><th>Thắng</th><th>Lãi/lỗ</th></tr></thead>';
   $('#stSym').innerHTML=hd+'<tbody>'+(d.by_symbol.map(row).join('')||'<tr><td colspan=4 class="muted">Không có lệnh</td></tr>')+'</tbody>';
   $('#stSide').innerHTML=hd+'<tbody>'+(d.by_side.map(row).join('')||'<tr><td colspan=4 class="muted">Không có lệnh</td></tr>')+'</tbody>';
   const ft=ts=>{ const x=new Date(ts*1000); return `${pad2(x.getUTCDate())}/${pad2(x.getUTCMonth()+1)} ${pad2(x.getUTCHours())}:${pad2(x.getUTCMinutes())}`; };
   $('#stTrades').innerHTML='<thead><tr><th>Đóng lúc</th><th>Position</th><th>Symbol</th><th>Chiều</th><th>Lot</th><th>Giá vào</th><th>Giá ra</th><th>Lãi/lỗ</th></tr></thead><tbody>'+
-    (d.trades.map(t=>`<tr><td>${ft(t.close_time)}</td><td>${t.position}</td><td><b>${esc(t.symbol)}</b></td><td style="color:${t.side==='BUY'?'var(--green)':'var(--red)'};font-weight:700">${t.side}</td><td>${fmt(t.volume,2)}</td><td>${t.open_price?fmt(t.open_price,t.open_price>1000?2:5):'—'}</td><td>${fmt(t.close_price,t.close_price>1000?2:5)}</td><td style="color:${col(t.net)};font-weight:700">${moneyS(t.net,c)}</td></tr>`).join('')||'<tr><td colspan=8 class="muted" style="text-align:center;padding:12px">Không có lệnh đóng trong khoảng này</td></tr>')+'</tbody>'; }
+    (d.trades.map(t=>`<tr><td>${ft(t.close_time)}</td><td>${esc(t.position)}</td><td><b>${esc(t.symbol)}</b></td><td style="color:${t.side==='BUY'?'var(--green)':'var(--red)'};font-weight:700">${esc(t.side)}</td><td>${fmt(t.volume,2)}</td><td>${t.open_price?fmt(t.open_price,t.open_price>1000?2:5):'—'}</td><td>${fmt(t.close_price,t.close_price>1000?2:5)}</td><td style="color:${col(t.net)};font-weight:700">${esc(moneyS(t.net,c))}</td></tr>`).join('')||'<tr><td colspan=8 class="muted" style="text-align:center;padding:12px">Không có lệnh đóng trong khoảng này</td></tr>')+'</tbody>'; }
 document.querySelectorAll('#stMode button').forEach(b=>b.onclick=()=>{ stMode=b.dataset.m; document.querySelectorAll('#stMode button').forEach(x=>x.classList.toggle('active',x===b)); drawCurve(); });
 function setupCanvas(cv,h){ const dpr=devicePixelRatio||1; cv.width=cv.clientWidth*dpr; cv.height=h*dpr; const g=cv.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0); return [g,cv.clientWidth,h]; }
 function niceTicks(lo,hi,n=5){ const span=hi-lo||1, step0=span/n, mag=Math.pow(10,Math.floor(Math.log10(step0))), st=[1,2,2.5,5,10].map(m=>m*mag).find(x=>x>=step0); const a=Math.floor(lo/st)*st, out=[]; for(let v=a; v<=hi+st*0.001; v+=st) out.push(v); return out; }
@@ -1134,7 +1142,7 @@ function drawCurve(){ if(!stData) return; const cv=$('#stCurve'); const [g,W,H]=
   if(key==='dd'){ const mi=vals.indexOf(Math.min(...vals)); const x=X(pts[mi].t), y=Y(vals[mi]); g.fillStyle='#ff5c5c'; g.beginPath(); g.arc(x,y,4,0,7); g.fill(); g.textAlign='left'; g.fillText('Max DD '+money(vals[mi],cur)+' ('+s.max_dd_pct+'%)',Math.min(x+6,W-170),y+14); }
   cv.onmousemove=e=>{ const rc=cv.getBoundingClientRect(), mx=e.clientX-rc.left; let best=0; pts.forEach((p,i)=>{ if(Math.abs(X(p.t)-mx)<Math.abs(X(pts[best].t)-mx)) best=i; }); const p=pts[best], d=new Date(p.t*1000);
     tip.style.display='block'; tip.style.left=(e.clientX+14)+'px'; tip.style.top=(e.clientY-10)+'px';
-    tip.innerHTML=`${pad2(d.getUTCDate())}/${pad2(d.getUTCMonth()+1)} ${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}<br>Lãi/lỗ: <b style="color:${p.cum>=0?'#2ecc71':'#ff5c5c'}">${moneyS(p.cum,cur)}</b><br>Balance: <b>${money(p.bal,cur)}</b><br>Drawdown: <b style="color:#ff5c5c">${money(p.dd,cur)} (${p.ddp}%)</b>`; };
+    tip.innerHTML=`${pad2(d.getUTCDate())}/${pad2(d.getUTCMonth()+1)} ${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}<br>Lãi/lỗ: <b style="color:${p.cum>=0?'#2ecc71':'#ff5c5c'}">${esc(moneyS(p.cum,cur))}</b><br>Balance: <b>${esc(money(p.bal,cur))}</b><br>Drawdown: <b style="color:#ff5c5c">${esc(money(p.dd,cur))} (${esc(p.ddp)}%)</b>`; };
   cv.onmouseleave=()=>tip.style.display='none'; }
 function drawBars(){ if(!stData) return; const cv=$('#stBars'); const [g,W,H]=setupCanvas(cv,170); const bs=stData.buckets, cur=stData.summary.currency;
   $('#stBarTitle').textContent='Lãi lỗ theo '+stData.bucket_unit;
@@ -1144,9 +1152,9 @@ function drawBars(){ if(!stData) return; const cv=$('#stBars'); const [g,W,H]=se
   niceTicks(lo,hi,4).forEach(v=>{ const y=Y(v); if(y<T-1||y>H-B+1) return; g.beginPath(); g.moveTo(L,y); g.lineTo(W-R,y); g.stroke(); g.textAlign='right'; g.fillText(Math.round(v).toLocaleString('en-US'),L-6,y+4); });
   const every=Math.ceil(bs.length/12);
   bs.forEach((b,i)=>{ const x=L+i*bw+bw*0.15, w=Math.max(2,bw*0.7), y0=Y(0), y1=Y(b.pnl); g.fillStyle=b.pnl>=0?'#2ecc71':'#ff5c5c'; g.fillRect(x,Math.min(y0,y1),w,Math.max(1,Math.abs(y1-y0)));
-    if(i%every===0){ g.fillStyle='#8a94ad'; g.textAlign='center'; g.fillText(b.label.slice(5).replace('-','/').split('/').reverse().join('/'),x+w/2,H-6); } });
+    if(i%every===0){ g.fillStyle='#8a94ad'; g.textAlign='center'; g.fillText(String(b.label||'').slice(5).replace('-','/').split('/').reverse().join('/'),x+w/2,H-6); } });
   cv.onmousemove=e=>{ const rc=cv.getBoundingClientRect(), i=Math.floor((e.clientX-rc.left-L)/bw); if(i<0||i>=bs.length){ tip.style.display='none'; return; } const b=bs[i];
-    tip.style.display='block'; tip.style.left=(e.clientX+14)+'px'; tip.style.top=(e.clientY-10)+'px'; tip.innerHTML=`${b.label}<br>${b.trades} lệnh · <b style="color:${b.pnl>=0?'#2ecc71':'#ff5c5c'}">${moneyS(b.pnl,cur)}</b>`; };
+    tip.style.display='block'; tip.style.left=(e.clientX+14)+'px'; tip.style.top=(e.clientY-10)+'px'; tip.innerHTML=`${esc(b.label)}<br>${esc(b.trades)} lệnh · <b style="color:${b.pnl>=0?'#2ecc71':'#ff5c5c'}">${esc(moneyS(b.pnl,cur))}</b>`; };
   cv.onmouseleave=()=>tip.style.display='none'; }
 window.addEventListener('resize',()=>{ if(stModal.classList.contains('show')){ drawCurve(); drawBars(); } });
 
@@ -1173,17 +1181,33 @@ async function loadScorecard(refresh){ try{ const d=await api('/api/agents/score
         <td style="color:${accCol};font-weight:700">${a.accuracy==null?'—':a.accuracy+'%'}</td><td>${fmt(a.base_weight,2)}</td>
         <td>${enough?'×'+fmt(a.factor,2):`<span class="muted" title="Cần ≥ ${d.min_votes} phiếu">chưa đủ ${d.min_votes} phiếu</span>`}</td>
         <td><b>${fmt(a.weight,2)}</b>${a.applied?' <span class="st ready">tự chỉnh</span>':''}</td></tr>`; }).join('');
-    $('#scRecent tbody').innerHTML=d.recent.length?d.recent.map(r=>`<tr><td>#${r.signal_id}</td><td>${esc(r.asset)}</td><td style="color:${voteColor(r.action)};font-weight:700">${esc(r.action)}</td>
+    $('#scRecent tbody').innerHTML=d.recent.length?d.recent.map(r=>`<tr><td>#${esc(r.signal_id)}</td><td>${esc(r.asset)}</td><td style="color:${voteColor(r.action)};font-weight:700">${esc(r.action)}</td>
       <td>${r.outcome==='win'?`<span class="st ready">${esc(r.exit_reason||'Đúng')}</span>`:r.outcome==='loss'?`<span class="st cooldown">${esc(r.exit_reason||'SL')}</span>`:'<span class="st off">Đang mở</span>'}</td>
       <td class="muted" title="${esc(r.detail)}">${esc({mt5_deal:'Deal MT5',history:'Lịch sử EA',candles:'Nến MT5'}[r.source]||r.detail||'—')}${r.net_profit?` (${r.net_profit>0?'+':''}${fmt(r.net_profit,2)}$)`:''}</td><td>${votesHtml(r.votes)}</td></tr>`).join('')
       :'<tr><td colspan="6" class="muted" style="text-align:center;padding:12px">Chưa có kèo nào được EA khớp lệnh thật</td></tr>';
   }catch(e){ $('#scInfo').textContent='Không tải được bảng điểm: '+e.message; } }
 $('#scRefresh').onclick=()=>loadScorecard(true);
 document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>showTab(b.dataset.tab));
+const SECRET_KEYS=['gemini_api_key','groq_api_key','openrouter_api_key','custom_api_key','telegram_bot_token','cryptocompare_api_key','bridge_token'];
+// Ô secret luôn để trống: chỉ hiện placeholder "(đã lưu …1234)", không bao giờ đổ chuỗi đã che vào value
+function fillSecretInputs(cfg){
+  for(const k of SECRET_KEYS){ const el=form.querySelector(`input[name="${k}"]`); if(!el) continue;
+    if(el.dataset.ph===undefined) el.dataset.ph=el.placeholder||'';
+    el.value=''; const v=String(cfg[k]||'');
+    el.placeholder=cfg[k+'_set']?'(đã lưu …'+v.slice(-4)+') — nhập để thay':el.dataset.ph;
+    let b=el.parentElement.querySelector(`button[data-clear="${k}"]`);
+    if(!b){ b=document.createElement('button'); b.type='button'; b.className='btn-ghost sm'; b.dataset.clear=k; b.textContent='🗑 Xoá key';
+      b.style.cssText='margin-top:4px;align-self:flex-start'; el.insertAdjacentElement('afterend',b); }
+    b.hidden=!cfg[k+'_set']; } }
+form.addEventListener('click',async e=>{ const b=e.target.closest('button[data-clear]'); if(!b) return; e.preventDefault();
+  const k=b.dataset.clear; if(!confirm('Xoá hẳn '+k+' đã lưu trên server?')) return;
+  try{ const r=await post('/api/config',{clear_keys:[k]}); if(!r.ok) return toast('Lỗi: '+(r.error||'không xoá được'));
+    lastCfg=r.config; fillSecretInputs(r.config); renderLlmOrder(lastCfg); toast('Đã xoá '+k); }catch(err){ toast('❌ Mất kết nối server'); } });
 async function openSettings(tab){
   const cfg=await api('/api/config');
   lastCfg=cfg; initLlmOrder(cfg); renderLlmOrder(cfg);
-  for(const el of form.querySelectorAll('input[name],select[name]')){ const k=el.name; if(k in cfg){ el.value=(typeof cfg[k]==='boolean')?String(cfg[k]):(cfg[k]??''); if(el.type==='password') el.placeholder=cfg[k+'_set']?'(đã lưu '+cfg[k]+') — nhập để thay':el.placeholder; } }
+  for(const el of form.querySelectorAll('input[name],select[name]')){ const k=el.name; if(SECRET_KEYS.includes(k)) continue; if(k in cfg){ el.value=(typeof cfg[k]==='boolean')?String(cfg[k]):(cfg[k]??''); } }
+  fillSecretInputs(cfg);
   gmModels=null; modal.classList.add('show'); showTab(tab); }
 $('#btnSettings').onclick=()=>openSettings('ai');
 $('#btnEaSettings').onclick=()=>openSettings('ea');
@@ -1191,7 +1215,7 @@ function closeModal(){ modal.classList.remove('show'); clearInterval(gmTimer); }
 $('#btnClose').onclick=closeModal; modal.onclick=e=>{ if(e.target===modal) closeModal(); };
 /* --- bảng model Gemini --- */
 const fmtDur=s=>{ s=Math.max(0,s|0); const h=Math.floor(s/3600), m=Math.floor(s%3600/60); return h?`${h}h${String(m).padStart(2,'0')}`:(m?`${m} phút`:`${s}s`); };
-async function loadGmStatus(){ try{ const st=await api('/api/llm/models'); gmStatus={}; st.models.forEach(m=>gmStatus[m.model]=m);
+async function loadGmStatus(){ try{ const st=await api('/api/llm/models'); st.models=Array.isArray(st.models)?st.models:[]; gmStatus={}; st.models.forEach(m=>gmStatus[m.model]=m);
     if(gmModels===null) gmModels=st.models.map(m=>({model:m.model,rpm:m.rpm,rpd:m.rpd,enabled:m.enabled}));
     const ready=st.models.filter(m=>m.state==='ready').length, used=st.models.reduce((a,m)=>a+m.used,0);
     $('#gmInfo').innerHTML=`<b style="color:var(--green)">${ready}</b>/${st.models.length} model sẵn sàng · đã dùng <b>${used}</b> request hôm nay · reset sau <b>${fmtDur(st.reset_in_sec)}</b>`;
@@ -1217,22 +1241,22 @@ function renderGm(force){ const tb=$('#gmTable tbody'); if(!gmModels) return;
       <td data-st="${i}">${stateBadge(m)}</td>
       <td style="white-space:nowrap"><button class="btn-ghost sm" data-test="${i}">Test</button> <button class="btn-ghost sm" data-del="${i}" title="Xoá">✕</button></td></tr>`; }).join('');
 }
-$('#gmTable').addEventListener('input',e=>{ const t=e.target, d=t.dataset;
+$('#gmTable').addEventListener('input',e=>{ const t=e.target, d=t.dataset; if(!gmModels) return;
   if(d.model!==undefined) gmModels[+d.model].model=t.value.trim();
   if(d.rpm!==undefined) gmModels[+d.rpm].rpm=+t.value||0;
   if(d.rpd!==undefined) gmModels[+d.rpd].rpd=+t.value||0;
 });
-$('#gmTable').addEventListener('change',e=>{ const d=e.target.dataset; if(d.en!==undefined){ gmModels[+d.en].enabled=e.target.checked; renderGm(true); } });
-$('#gmTable').addEventListener('click',async e=>{ const d=e.target.dataset; if(!d) return;
+$('#gmTable').addEventListener('change',e=>{ const d=e.target.dataset; if(!gmModels) return; if(d.en!==undefined){ gmModels[+d.en].enabled=e.target.checked; renderGm(true); } });
+$('#gmTable').addEventListener('click',async e=>{ const d=e.target.dataset; if(!d||!gmModels) return;
   const swap=(i,j)=>{ if(j<0||j>=gmModels.length) return; [gmModels[i],gmModels[j]]=[gmModels[j],gmModels[i]]; renderGm(true); };
   if(d.up!==undefined) swap(+d.up,+d.up-1);
   if(d.down!==undefined) swap(+d.down,+d.down+1);
   if(d.del!==undefined){ gmModels.splice(+d.del,1); renderGm(true); }
   if(d.test!==undefined){ const m=gmModels[+d.test].model; e.target.textContent='...'; const r=await post('/api/gemini/test',{model:m});
     toast(r.ok?`✅ ${m} trả lời trong ${r.ms} ms`:`❌ ${m}: ${r.error}`); e.target.textContent='Test'; loadGmStatus(); } });
-$('#gmAdd').onclick=()=>{ gmModels.push({model:'',rpm:5,rpd:20,enabled:true}); renderGm(true); const ins=$('#gmTable tbody').querySelectorAll('input[type=text]'); ins[ins.length-1].focus(); };
+$('#gmAdd').onclick=()=>{ if(!gmModels) gmModels=[]; gmModels.push({model:'',rpm:5,rpd:20,enabled:true}); renderGm(true); const ins=$('#gmTable tbody').querySelectorAll('input[type=text]'); ins[ins.length-1].focus(); };
 $('#gmDiscover').onclick=async()=>{ toast('Đang hỏi Google danh sách model...'); const r=await post('/api/gemini/discover'); if(r.error) return toast('❌ '+r.error);
-  gmModels=null; await loadGmStatus(); toast(r.added.length?`Thêm ${r.added.length} model mới (đang tắt, bấm Test rồi bật): ${r.added.join(', ')}`:`Không có model mới (Google trả ${r.found.length} model văn bản)`); };
+  gmModels=null; await loadGmStatus(); const added=r.added||[], found=r.found||[]; toast(added.length?`Thêm ${added.length} model mới (đang tắt, bấm Test rồi bật): ${added.join(', ')}`:`Không có model mới (Google trả ${found.length} model văn bản)`); };
 $('#gmReset').onclick=async()=>{ await post('/api/gemini/reset_cooldown'); toast('Đã xoá trạng thái nghỉ, lần họp tới sẽ thử lại mọi model'); loadGmStatus(); };
 /* --- thứ tự gọi nhà cung cấp LLM (kéo thả) --- */
 const LLM_PROVIDER_META={
@@ -1276,11 +1300,14 @@ function renderLlmOrder(cfg){
     [llmOrder[i],llmOrder[j]]=[llmOrder[j],llmOrder[i]]; renderLlmOrder(lastCfg); });
 })();
 /* --- lưu --- */
-$('#btnSave').onclick=async()=>{ const body={}; for(const el of form.querySelectorAll('input[name],select[name]')){ body[el.name]=(el.value==='true')?true:(el.value==='false')?false:el.value; }
+$('#btnSave').onclick=async()=>{ const body={}; for(const el of form.querySelectorAll('input[name],select[name]')){ if(SECRET_KEYS.includes(el.name)&&!el.value) continue; body[el.name]=(el.value==='true')?true:(el.value==='false')?false:el.value; }
   if(gmModels) body.gemini_models=gmModels.filter(m=>m.model);
   body.llm_provider_order=llmOrder;
-  const r=await post('/api/config',body); if(r.ok){ toast('Đã lưu: '+(r.changed.length?r.changed.length+' mục':'không đổi')); gmModels=null; loadGmStatus(); poll(); if(curTab==='agents') loadScorecard(true); } else toast('Lỗi: '+r.error); };
-$('#btnTestLlm').onclick=async()=>{ toast('Đang test chuỗi LLM (Gemini → Groq → ...)...'); const r=await post('/api/llm/test'); toast(r.ok?'✅ LLM OK qua '+r.provider:'❌ '+(r.errors.join(' | ')||'Chưa có key → dùng Quant AI')); loadGmStatus(); };
+  let r; try{ r=await post('/api/config',body); }catch(e){ return toast('❌ Mất kết nối server, chưa lưu được'); }
+  if(r.ok){ const ch=r.changed||[]; toast('Đã lưu: '+(ch.length?ch.length+' mục':'không đổi'));
+    if(r.config){ lastCfg=r.config; initLlmOrder(lastCfg); fillSecretInputs(lastCfg); } renderLlmOrder(lastCfg);
+    gmModels=null; loadGmStatus(); poll(); if(curTab==='agents') loadScorecard(true); } else toast('Lỗi: '+(r.error||'không rõ')); };
+$('#btnTestLlm').onclick=async()=>{ toast('Đang test chuỗi LLM (Gemini → Groq → ...)...'); const r=await post('/api/llm/test'); toast(r.ok?'✅ LLM OK qua '+r.provider:'❌ '+((r.errors||[]).join(' | ')||r.error||'Chưa có key → dùng Quant AI')); loadGmStatus(); };
 $('#btnTestTg').onclick=async()=>{ toast('Đang gửi Telegram...'); const r=await post('/api/telegram/test'); toast(r.ok?'✅ Telegram đã nhận tin':'❌ Telegram: '+r.message); };
 </script>
 </body>

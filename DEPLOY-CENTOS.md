@@ -3,14 +3,14 @@
 Mô hình:
 
 ```
-VPS Exness (MT5 + EA) ──Internet──▶ 27.72.104.150:18080 (FortiGate) ──VIP──▶ 10.10.101.22:8080 (CentOS, server)
-Bạn (Mac, 4G, bất kỳ đâu) ──────────▶ http://27.72.104.150:18080  (đăng nhập admin / mật khẩu)
+VPS Exness (MT5 + EA) ──Internet──▶ <IP_PUBLIC>:18080 (FortiGate) ──VIP──▶ <IP_LAN>:8080 (CentOS, server)
+Bạn (Mac, 4G, bất kỳ đâu) ──────────▶ http://<IP_PUBLIC>:18080  (đăng nhập admin / mật khẩu)
 ```
 
 | Thông số | Giá trị |
 |---|---|
-| IP LAN CentOS | `10.10.101.22` |
-| IP public (FortiGate) | `27.72.104.150` |
+| IP LAN CentOS | `<IP_LAN>` |
+| IP public (FortiGate) | `<IP_PUBLIC>` |
 | Cổng public | `18080` (khác 8080 để bớt bị dò cổng) |
 | Cổng server trong LAN | `8080` |
 | Thư mục cài | `/home/ai-office` |
@@ -26,7 +26,7 @@ Có 2 cách chạy, chọn **một**:
 
 1. FileZilla > **File > Site Manager > New site**:
    - Protocol: **SFTP – SSH File Transfer Protocol**
-   - Host: `10.10.101.22` (đang ở LAN) · Port: `22`
+   - Host: `<IP_LAN>` (đang ở LAN) · Port: `22`
    - Logon Type: Normal · User: `root` (hoặc user của bạn) · Password
 2. Bấm **Connect**. Bên phải (Remote site) gõ `/home` vào ô đường dẫn, chuột phải > **Create directory** > `ai-office`, rồi mở `/home/ai-office`.
 3. Bên trái (Local site) mở `/Users/tuannm/CODE/claude-ai-trading-office`. Chọn và kéo sang phải:
@@ -45,7 +45,7 @@ Lần sau cập nhật code: kéo đè các file đã sửa, chọn **Overwrite*
 Trên Mac mở Terminal:
 
 ```bash
-ssh root@10.10.101.22
+ssh root@<IP_LAN>
 ```
 
 Nếu `yum` báo `Could not resolve host: mirrorlist.centos.org`, trỏ sang vault:
@@ -76,7 +76,7 @@ Cũng trong `.env`, đặt tên container theo ý bạn (chỉ chữ thường, 
 |---|---|
 | `APP_NAME` | Tên container (`docker ps` sẽ hiện tên này), được dùng chữ hoa |
 | `COMPOSE_PROJECT_NAME` | Tên project, tên image sẽ là `<project>-app`. **Bắt buộc chữ thường** |
-| `APP_PORT` | Cổng trên host, mặc định 8080. Đổi thì sửa luôn firewalld và FortiGate cho khớp |
+| `APP_PORT` | Cổng **phía host** map vào cổng 8080 trong container (`${APP_PORT}:8080`). `.env.example` để `18080`; theo sơ đồ trên (firewalld + FortiGate map tới 8080) thì đặt `APP_PORT=8080`, đổi thì sửa luôn firewalld và FortiGate cho khớp. **Không** đặt `OFFICE_PORT` trong `.env` (server trong container sẽ nghe sai cổng) |
 
 ---
 
@@ -164,7 +164,7 @@ Nếu status báo `Permission denied` dù file đọc được, kiểm tra SELin
 firewall-cmd --permanent --add-port=8080/tcp && firewall-cmd --reload && firewall-cmd --list-ports
 ```
 
-Trên Mac mở `http://10.10.101.22:8080`, trình duyệt hỏi user/mật khẩu: nhập `admin` và mật khẩu ở bước 3. Thấy văn phòng là xong phần server.
+Trên Mac mở `http://<IP_LAN>:8080`, trình duyệt hỏi user/mật khẩu: nhập `admin` và mật khẩu ở bước 3. Thấy văn phòng là xong phần server.
 
 ---
 
@@ -177,10 +177,10 @@ GUI: **Policy & Objects > Virtual IPs > Create New > Virtual IP**
 | Trường | Giá trị |
 |---|---|
 | Name | `VIP-AI-Office` |
-| Interface | cổng WAN đang mang IP 27.72.104.150 (ví dụ `wan1`) |
+| Interface | cổng WAN đang mang IP <IP_PUBLIC> (ví dụ `wan1`) |
 | Type | Static NAT |
-| External IP address/range | `27.72.104.150` |
-| Map to IPv4 address/range | `10.10.101.22` |
+| External IP address/range | `<IP_PUBLIC>` |
+| Map to IPv4 address/range | `<IP_LAN>` |
 | Port Forwarding | Bật · Protocol **TCP** |
 | External service port | `18080` |
 | Map to IPv4 port | `8080` |
@@ -191,8 +191,8 @@ CLI tương đương:
 config firewall vip
     edit "VIP-AI-Office"
         set extintf "wan1"
-        set extip 27.72.104.150
-        set mappedip "10.10.101.22"
+        set extip <IP_PUBLIC>
+        set mappedip "<IP_LAN>"
         set portforward enable
         set protocol tcp
         set extport 18080
@@ -209,7 +209,7 @@ end
 |---|---|
 | Name | `WAN-to-AI-Office` |
 | Incoming Interface | `wan1` |
-| Outgoing Interface | cổng LAN chứa 10.10.101.22 (ví dụ `internal`) |
+| Outgoing Interface | cổng LAN chứa <IP_LAN> (ví dụ `internal`) |
 | Source | `all` (hoặc chỉ IP VPS, xem 6.3) |
 | Destination | `VIP-AI-Office` |
 | Schedule | always |
@@ -248,24 +248,24 @@ Kéo policy lên trên các policy deny chung nếu có.
 Trên VPS Exness (PowerShell):
 
 ```powershell
-curl.exe -s http://27.72.104.150:18080/api/health
+curl.exe -s http://<IP_PUBLIC>:18080/api/health
 ```
 
 Trả `{"ok": true, ...}` là thông. Nếu không:
 
 - FortiGate **Log & Report > Forward Traffic**, lọc Destination Port `18080`, xem bị deny ở policy nào.
 - Trên CentOS: `curl -s http://127.0.0.1:8080/api/health` (server sống?) và `firewall-cmd --list-ports` (8080 mở?).
-- Thử từ 4G điện thoại: mở `http://27.72.104.150:18080`, phải hiện hộp đăng nhập.
-- Mở từ máy trong LAN bằng IP public có thể không vào được (hairpin NAT); trong LAN cứ dùng `http://10.10.101.22:8080`.
+- Thử từ 4G điện thoại: mở `http://<IP_PUBLIC>:18080`, phải hiện hộp đăng nhập.
+- Mở từ máy trong LAN bằng IP public có thể không vào được (hairpin NAT); trong LAN cứ dùng `http://<IP_LAN>:8080`.
 
 ---
 
 ## Bước 7. Bridge Token và EA trên VPS
 
 1. Dashboard > 🔑 Cài Đặt > mục "6. Cầu nối MT5 realtime" > nhập **Bridge Token** (chuỗi ngẫu nhiên, ví dụ `openssl rand -hex 16`) > Lưu.
-2. MT5 trên VPS: **Tools > Options > Expert Advisors** > tick **Allow WebRequest for listed URL** > Add `http://27.72.104.150:18080` (không có `/` cuối).
+2. MT5 trên VPS: **Tools > Options > Expert Advisors** > tick **Allow WebRequest for listed URL** > Add `http://<IP_PUBLIC>:18080` (không có `/` cuối).
 3. Kéo EA `AITradingOffice` vào chart, input:
-   - `ServerUrl` = `http://27.72.104.150:18080`
+   - `ServerUrl` = `http://<IP_PUBLIC>:18080`
    - `BridgeToken` = token ở bước 7.1
 4. Tab Experts hiện `Cấu hình từ server: gold=XAUUSDm ...`. Dashboard hiện **MT5 ✓** và **EA ✓ hh:mm**, thẻ vàng hiện **🟢 MT5 realtime** kèm Bid/Ask.
 
@@ -279,7 +279,7 @@ Các endpoint EA được phép đi bằng token thay mật khẩu: `/api/push_p
 - [ ] `.env` có `OFFICE_ADMIN_PASSWORD`
 - [ ] Docker: `docker compose up -d --build` · hoặc systemd: `systemctl enable --now ai-office`
 - [ ] `firewall-cmd --add-port=8080/tcp`
-- [ ] LAN: `http://10.10.101.22:8080` hỏi mật khẩu và vào được
-- [ ] FortiGate: VIP `27.72.104.150:18080 → 10.10.101.22:8080`, policy NAT tắt
-- [ ] VPS: `curl.exe http://27.72.104.150:18080/api/health` trả ok
+- [ ] LAN: `http://<IP_LAN>:8080` hỏi mật khẩu và vào được
+- [ ] FortiGate: VIP `<IP_PUBLIC>:18080 → <IP_LAN>:8080`, policy NAT tắt
+- [ ] VPS: `curl.exe http://<IP_PUBLIC>:18080/api/health` trả ok
 - [ ] Đặt Bridge Token, MT5 Allow WebRequest, EA điền ServerUrl + BridgeToken
