@@ -91,6 +91,50 @@ except Exception:
     SSL_CTX = ssl._create_unverified_context()
 if os.environ.get("OFFICE_INSECURE_SSL") == "1":
     SSL_CTX = ssl._create_unverified_context()
+_SSL_REFRESH = {"ts": 0.0, "lock": threading.Lock()}
+
+
+def _is_cert_error(e):
+    r = getattr(e, "reason", e)
+    return isinstance(r, ssl.SSLError) and "CERTIFICATE_VERIFY_FAILED" in str(r)
+
+
+def _refresh_ssl_ctx(url):
+    """Windows chỉ tải root CA khi chính Windows (SChannel) cần tới, Python không kích hoạt được việc này.
+    Service chạy LocalSystem có thể thiếu root (vd Go Daddy G2 của api.telegram.org) -> gọi HTTPS qua
+    PowerShell để Windows tự cài root, rồi nạp lại kho CA. Giới hạn 10 phút/lần."""
+    global SSL_CTX
+    if os.environ.get("OFFICE_INSECURE_SSL") == "1":
+        return False
+    with _SSL_REFRESH["lock"]:
+        if time.time() - _SSL_REFRESH["ts"] < 600:
+            return False
+        _SSL_REFRESH["ts"] = time.time()
+        if os.name == "nt":
+            try:
+                import subprocess
+                host = urllib.parse.urlsplit(url).netloc
+                subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                                "try { Invoke-WebRequest -UseBasicParsing -Method Head -TimeoutSec 15 -Uri 'https://%s/' | Out-Null } catch {}" % host],
+                               timeout=40, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                print("ssl refresh:", e)
+        try:
+            SSL_CTX = ssl.create_default_context()
+            print("SSL: đã nạp lại kho CA sau lỗi chứng chỉ (%s)" % urllib.parse.urlsplit(url).netloc)
+            return True
+        except Exception:
+            return False
+
+
+def _urlopen(req, timeout):
+    """urlopen + thử lại 1 lần sau khi nạp lại kho CA nếu lỗi xác thực chứng chỉ."""
+    try:
+        return urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX)
+    except urllib.error.URLError as e:
+        if _is_cert_error(e) and _refresh_ssl_ctx(req.full_url):
+            return urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX)
+        raise
 
 # ============================================================================
 # 0. CẤU HÌNH
@@ -595,7 +639,7 @@ USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AITradingOffice/1.0"
 def http_get_json(url, headers=None, timeout=12):
     req = urllib.request.Request(url, headers=dict({"User-Agent": USER_AGENT,
                                                    "Accept": "application/json"}, **(headers or {})))
-    with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as resp:
+    with _urlopen(req, timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -604,7 +648,7 @@ def http_post_json(url, payload, headers=None, timeout=60):
     h = {"User-Agent": USER_AGENT, "Content-Type": "application/json"}
     h.update(headers or {})
     req = urllib.request.Request(url, data=body, headers=h, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as resp:
+    with _urlopen(req, timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -628,7 +672,7 @@ def http_post_form_file(url, fields, field_name, filename, raw_bytes, mime="imag
         "Content-Type": "multipart/form-data; boundary=" + boundary,
         "Content-Length": str(len(body)),
     }, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as resp:
+    with _urlopen(req, timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -1600,7 +1644,7 @@ RSS_FEEDS = [
 def fetch_rss(name, url, limit=5):
     import xml.etree.ElementTree as ET
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=10, context=SSL_CTX) as resp:
+    with _urlopen(req, 10) as resp:
         root = ET.fromstring(resp.read())
     out = []
     for it in root.findall(".//item")[:limit]:
