@@ -193,7 +193,7 @@ table.gm .ord button{padding:1px 6px;font-size:10px;display:block;margin:1px 0}
         <div class="stat"><b>VWAP</b><span data-k="vwap">—</span></div>
         <div class="stat"><b>EMA50</b><span data-k="ema50">—</span></div>
         <div class="stat"><b>RSI(14)</b><span data-k="rsi14">—</span></div>
-        <div class="stat"><b>Volume (RVOL)</b><span data-k="rvol">—</span></div>
+        <div class="stat"><b title="RVOL nến đã đóng gần nhất · nến đang chạy quy đổi theo thời gian đã trôi">Volume (RVOL)</b><span data-k="rvol">—</span></div>
         <div class="stat"><b>Xu hướng</b><span data-k="structure">—</span></div>
       </div>
     </div>
@@ -204,7 +204,7 @@ table.gm .ord button{padding:1px 6px;font-size:10px;display:block;margin:1px 0}
         <div class="stat"><b>VWAP</b><span data-k="vwap">—</span></div>
         <div class="stat"><b>EMA50</b><span data-k="ema50">—</span></div>
         <div class="stat"><b>RSI(14)</b><span data-k="rsi14">—</span></div>
-        <div class="stat"><b>Volume (RVOL)</b><span data-k="rvol">—</span></div>
+        <div class="stat"><b title="RVOL nến đã đóng gần nhất · nến đang chạy quy đổi theo thời gian đã trôi">Volume (RVOL)</b><span data-k="rvol">—</span></div>
         <div class="stat"><b>Xu hướng</b><span data-k="structure">—</span></div>
       </div>
     </div>
@@ -339,7 +339,8 @@ table.gm .ord button{padding:1px 6px;font-size:10px;display:block;margin:1px 0}
       <label>Tính khối lượng theo <select name="use_mt5_balance"><option value="true">Số dư thật của tài khoản MT5 (EA gửi về)</option><option value="false">Vốn quỹ nhập tay ở ô bên cạnh</option></select></label>
       <label>% Rủi ro mỗi lệnh <input name="risk_per_trade_pct" type="number" step="0.1" min="0.1" max="10"></label>
       <label>Khung thời gian <select name="timeframe"><option>5m</option><option>15m</option><option>1h</option><option>4h</option></select></label>
-      <label>Chu kỳ Auto-Pilot (phút) <input name="auto_interval_min" type="number" min="5" step="5"></label>
+      <label>Khoảng cách tối thiểu giữa 2 lần họp Auto-Pilot (phút) <input name="auto_interval_min" type="number" min="5" step="5"></label>
+      <label>Thời điểm Auto-Pilot họp <select name="autopilot_align_bar_close"><option value="true">Ngay sau khi nến khung đang chọn đóng (~8 giây, giờ broker)</option><option value="false">Theo chu kỳ phút, thời điểm bất kỳ trong nến</option></select></label>
       <div class="sec">Chặn dồn lệnh & tự học (kèo bị chặn sẽ thành WAIT: không gửi Telegram, EA không vào)</div>
       <label>Số kèo thật đang mở tối đa cùng tài sản cùng chiều (0 = tắt) <input name="max_same_dir_open" type="number" min="0" max="10" step="1"></label>
       <label>Nghỉ chiều đó sau khi 1 kèo cùng chiều đóng lỗ (phút, 0 = tắt) <input name="cooldown_after_sl_min" type="number" min="0" max="1440" step="5"></label>
@@ -408,7 +409,7 @@ table.gm .ord button{padding:1px 6px;font-size:10px;display:block;margin:1px 0}
       <p class="hint" id="lrMfeNote"></p>
       <div class="sec" style="font-weight:700;margin-top:14px">3. Thống kê theo setup</div>
       <div class="gm-wrap" style="max-height:320px;overflow-y:auto"><table class="gm" id="lrSetups">
-        <thead><tr><th>Tài sản</th><th>Chiều</th><th>Trạng thái</th><th>Cấu trúc</th><th>Vùng VWAP</th><th>Phiên</th><th>Số lệnh</th><th>Thắng</th><th>Kỳ vọng</th><th></th></tr></thead>
+        <thead><tr><th>Tài sản</th><th>Chiều</th><th>Trạng thái</th><th>Cấu trúc</th><th>Vùng VWAP</th><th>Phiên</th><th>Số lệnh</th><th>Thắng</th><th title="Kỳ vọng R trước chi phí">Kỳ vọng</th><th title="Chi phí R trung bình = spread lúc ra kèo / khoảng SL">Chi phí</th><th title="Kỳ vọng sau chi phí: luật chặn setup âm dùng cột này">KV ròng</th><th></th></tr></thead>
         <tbody></tbody>
       </table></div>
       <p class="hint" id="lrSetupNote"></p>
@@ -947,7 +948,9 @@ function renderTicker(asset,m){
   const rv=el.querySelector('[data-k=rvol]');
   if(rv){
     const vr=Number(ind.vol_ratio||1); const vsa=ind.vsa_signal||'NORMAL';
-    rv.textContent=fmt(vr,2)+'× ('+vsa+')';
+    const live=ind.vol_ratio_live!=null?' · chạy '+fmt(ind.vol_ratio_live,2)+'×':'';
+    rv.textContent=fmt(vr,2)+'× ('+vsa+')'+live;
+    rv.title='RVOL nến đã đóng gần nhất: '+fmt(vr,2)+'×'+(ind.vol_ratio_live!=null?' · nến đang chạy (đã trôi '+Math.round(Number(ind.bar_progress||0)*100)+'%) quy đổi: '+fmt(ind.vol_ratio_live,2)+'×':'');
     rv.style.color=vr>=1.35?'var(--accent)':(vr<0.7?'var(--muted)':'var(--text)');
   }
   const st=el.querySelector('[data-k=structure]'); st.textContent={UPTREND:'📈 Tăng',DOWNTREND:'📉 Giảm',SIDEWAY:'↔️ Sideway'}[ind.structure]||'—'; st.style.color=ind.structure==='UPTREND'?'var(--green)':ind.structure==='DOWNTREND'?'var(--red)':'var(--accent)';
@@ -1235,22 +1238,26 @@ async function loadLearning(){ try{ const d=await api('/api/learning'); if(d.err
     const m=d.mfe||{}, cn=m.counts||{}, pc=m.pct||{}; const pctTxt=k=>pc[k]==null?'—':pc[k]+'%';
     $('#lrKpis').innerHTML=[['Sai hướng (MFE < '+esc(th.wrong_r)+'R)','wrong_direction','var(--red)'],['SL quá chặt (MFE ≥ '+esc(th.tight_r)+'R rồi dính SL)','stop_too_tight','var(--accent)'],['Hướng đúng','good','var(--green)']]
       .map(([t,k,col])=>`<div class="kpi"><b>${t}</b><span style="color:${col}">${esc(pctTxt(k))}</span> <span class="muted">${esc(cn[k]||0)} kèo</span></div>`).join('')
-      +`<div class="kpi"><b>Chưa đo được (thiếu nến M5)</b><span>${esc(cn.unknown||0)}</span> <span class="muted">/ ${esc(m.total||0)} kèo</span></div>`;
+      +`<div class="kpi"><b>Chưa đo được (đang chờ / thiếu nến M5)</b><span>${esc(cn.unknown||0)}</span> <span class="muted">/ ${esc(m.total||0)} kèo</span></div>`;
     $('#lrMfe tbody').innerHTML=(m.rows||[]).length?m.rows.map(r=>{ const cl=MFE_CLS[r.mfe_class];
       return `<tr><td>#${esc(r.signal_id)}</td><td>${esc(r.asset)}</td><td style="color:${voteColor(r.action)};font-weight:700">${esc(r.action)}</td>
         <td>${r.outcome==='win'?`<span class="st ready">${esc(r.exit_reason||'Thắng')}</span>`:`<span class="st cooldown">${esc(r.exit_reason||'SL')}</span>`}</td>
         <td style="color:${r.r>=0?'var(--green)':'var(--red)'}">${esc(fmtR(r.r))}</td>
         <td title="${esc(r.mfe==null?'':fmt(r.mfe,2))}">${esc(fmtR(r.mfe_r))}</td><td title="${esc(r.mae==null?'':fmt(r.mae,2))}">${r.mae_r==null?'—':'-'+esc(Number(r.mae_r).toFixed(2))+'R'}</td>
-        <td>${cl?`<span class="st ${cl[1]}">${esc(cl[0])}</span>`:'<span class="st off">chưa đo</span>'}</td><td class="muted">${esc(r.setup)}</td></tr>`; }).join('')
+        <td>${cl?`<span class="st ${cl[1]}">${esc(cl[0])}</span>`:(r.no_candles?'<span class="st off" title="EA đã gửi lại nhưng broker không có nến lúc vào lệnh">không có nến</span>':'<span class="st off">chưa đo</span>')}</td><td class="muted">${esc(r.setup)}</td></tr>`; }).join('')
       :'<tr><td colspan="9" class="muted" style="text-align:center;padding:12px">Chưa có kèo nào (khớp thật hoặc đã gửi Telegram) có kết quả</td></tr>';
-    $('#lrMfeNote').innerHTML=`MFE/MAE đo trên nến MT5 M5 từ lúc vào lệnh tới lúc đóng, R = khoảng cách entry → SL. Chỉ kèo <b>sai hướng</b> mới bị trừ điểm agent ở bảng điểm; kèo thua do SL quá chặt hoặc thua thường không trừ.`;
+    const m5=d.m5||{}, gp=m5.gaps||{};
+    const m5Txt=Object.keys(m5.assets||{}).map(a=>`${esc(a)} ${esc(m5.assets[a].rows)} nến (${esc(m5.assets[a].from)} → ${esc(m5.assets[a].to)})`).join(' · ')||'chưa có';
+    const gapTxt=(gp.pending||gp.done||gp.failed)?` · Xin EA nến cũ: <b>${esc(gp.pending||0)}</b> chờ, ${esc(gp.done||0)} xong, ${esc(gp.failed||0)} lỗi${gp.pending&&!m5.ea_supports_request?' <span style="color:var(--accent)">(cần EA ≥ 1.33, đang chạy '+esc(m5.ea_version||'?')+')</span>':''}`:'';
+    $('#lrMfeNote').innerHTML=`MFE/MAE đo trên nến MT5 M5 (lưu lâu dài trong SQLite, giờ broker) từ lúc vào lệnh tới lúc đóng, R = khoảng cách entry → SL. Chỉ kèo <b>sai hướng</b> mới bị trừ điểm agent ở bảng điểm; kèo thua do SL quá chặt hoặc thua thường không trừ.<br>Kho nến M5: ${m5Txt}${gapTxt}`;
     const st=d.setups||[];
     $('#lrSetups tbody').innerHTML=st.length?st.map(r=>{ const enough=r.n>=th.min_show;
       const tag=r.blocking?(c.block_negative_setups?'<span class="st cooldown">⛔ Đang chặn</span>':'<span class="st cooldown">Âm (chưa bật chặn)</span>'):(enough?'<span class="st ready">Đủ mẫu</span>':`<span class="st off">cần ≥ ${esc(th.min_show)}</span>`);
       return `<tr class="${enough?'':'off'}"><td>${esc(r.asset)}</td><td style="color:${voteColor(r.action)};font-weight:700">${esc(r.action)}</td><td>${esc(r.regime)}</td><td>${esc(r.structure)}</td><td>${esc(r.vwap_zone)}</td><td>${esc(r.session)}</td>
-        <td><b>${esc(r.n)}</b></td><td>${esc(r.win_rate)}% <span class="muted">(${esc(r.wins)}/${esc(r.losses)})</span></td><td style="color:${r.exp_r>=0?'var(--green)':'var(--red)'};font-weight:700">${esc(fmtR(r.exp_r))}</td><td>${tag}</td></tr>`; }).join('')
-      :'<tr><td colspan="10" class="muted" style="text-align:center;padding:12px">Chưa có dữ liệu setup</td></tr>';
-    $('#lrSetupNote').innerHTML=`Setup = tài sản · chiều · trạng thái thị trường · cấu trúc · vùng VWAP · phiên (UTC: Á 21h–7h, London 7h–12h, NY 12h–21h). Prompt LLM nhận 5 setup tốt nhất và 5 tệ nhất có ≥ ${esc(th.min_show)} lệnh. Setup có ≥ ${esc(th.min_block)} lệnh và kỳ vọng âm bị hạ WAIT khi bật chặn.`;
+        <td><b>${esc(r.n)}</b></td><td>${esc(r.win_rate)}% <span class="muted">(${esc(r.wins)}/${esc(r.losses)})</span></td><td style="color:${r.exp_r>=0?'var(--green)':'var(--red)'}">${esc(fmtR(r.exp_r))}</td>
+        <td class="muted" title="${esc(r.cost_n||0)}/${esc(r.n)} lệnh có số liệu spread">${r.cost_r==null?'—':'-'+esc(Number(r.cost_r).toFixed(2))+'R'}</td><td style="color:${r.exp_net_r>=0?'var(--green)':'var(--red)'};font-weight:700">${esc(fmtR(r.exp_net_r))}</td><td>${tag}</td></tr>`; }).join('')
+      :'<tr><td colspan="12" class="muted" style="text-align:center;padding:12px">Chưa có dữ liệu setup</td></tr>';
+    $('#lrSetupNote').innerHTML=`Setup = tài sản · chiều · trạng thái thị trường · cấu trúc · vùng VWAP · phiên (UTC: Á 21h–7h, London 7h–12h, NY 12h–21h). Prompt LLM nhận 5 setup tốt nhất và 5 tệ nhất có ≥ ${esc(th.min_show)} lệnh. Setup có ≥ ${esc(th.min_block)} lệnh và <b>kỳ vọng ròng</b> âm bị hạ WAIT khi bật chặn. Chi phí = spread lúc ra kèo / khoảng SL; kèo có lệnh khớp thật đã gồm spread trong giá khớp nên không trừ lại.`;
   }catch(e){ $('#lrInfo').textContent='Không tải được dữ liệu tự học: '+e.message; } }
 $('#lrRefresh').onclick=()=>loadLearning();
 document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>showTab(b.dataset.tab));

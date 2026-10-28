@@ -77,7 +77,8 @@ HOST = os.environ.get("OFFICE_HOST", "0.0.0.0")
 ADMIN_USER = os.environ.get("OFFICE_ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.environ.get("OFFICE_ADMIN_PASSWORD", "")
 # Các endpoint EA được gọi bằng X-Bridge-Token thay cho mật khẩu dashboard
-EA_PATHS = ("/api/push_price", "/api/push_account", "/api/push_history", "/api/push_closed", "/api/ea/config", "/api/signals", "/api/execution", "/api/health")
+EA_PATHS = ("/api/push_price", "/api/push_account", "/api/push_history", "/api/push_closed", "/api/push_candles_m5", "/api/ea/config",
+            "/api/signals", "/api/execution", "/api/health")
 PORT = int(os.environ.get("OFFICE_PORT", "8080"))
 
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -131,7 +132,8 @@ DEFAULT_CONFIG = {
     "risk_per_trade_pct": 1.0,
     "timeframe": "15m",
     "auto_pilot": False,
-    "auto_interval_min": 30,
+    "auto_interval_min": 30,                  # khoảng cách tối thiểu giữa 2 lần họp Auto-Pilot (phút)
+    "autopilot_align_bar_close": True,        # Auto-Pilot họp ngay sau khi nến khung đang chọn đóng (trễ ~8s) thay vì chạy theo chu kỳ phút
     "quant_consensus": 0.4,                   # ngưỡng đồng thuận = |điểm có trọng số| / tổng trọng số
     "agent_auto_weight": True,                # tự động điều chỉnh trọng số agent theo tỷ lệ thắng/thua SL/TP thực tế (từ 5 phiếu)
     "max_same_dir_open": 1,                   # số kèo thật đang mở cùng tài sản cùng chiều tối đa; đạt ngưỡng thì kèo mới bị hạ WAIT (0 = tắt)
@@ -267,6 +269,19 @@ def db_init():
             mfe_class TEXT DEFAULT '',
             mfe_bars INTEGER DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS candles_m5 (
+            asset TEXT NOT NULL, t INTEGER NOT NULL,
+            o REAL, h REAL, l REAL, c REAL, v REAL,
+            PRIMARY KEY (asset, t)
+        );
+        CREATE TABLE IF NOT EXISTS candle_gaps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset TEXT NOT NULL, t_from INTEGER NOT NULL, t_to INTEGER NOT NULL,
+            status TEXT DEFAULT 'pending', tries INTEGER DEFAULT 0,
+            created_at TEXT, updated_at TEXT,
+            signal_ids TEXT DEFAULT '', n_candles INTEGER DEFAULT 0, error TEXT DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_gaps_status ON candle_gaps (status, asset);
         """)
         # Tự động nâng cấp bảng cũ nếu CSDL đã tạo từ phiên bản trước
         for sql in (
@@ -769,6 +784,7 @@ def mt5_push(payload):
     tf = payload.get("tf")
     candles = payload.get("candles") or []
     need_full = False
+    clean_m5 = None
     with MT5_LOCK:
         tick = payload.get("tick")
         if tick and tick.get("bid") is not None:
@@ -786,6 +802,8 @@ def mt5_push(payload):
             for c in candles:
                 clean.append({"t": int(c["t"]), "o": float(c["o"]), "h": float(c["h"]), "l": float(c["l"]),
                               "c": float(c["c"]), "v": float(c.get("v") or 0.0)})
+            if tf == "5m":
+                clean_m5 = clean
             old = MT5_FEED.get((asset, tf))
             if len(clean) >= 30 or not old:
                 merged = {c["t"]: c for c in clean}                       # gói đầy đủ
@@ -800,6 +818,11 @@ def mt5_push(payload):
                 need_full = True
     if tf in TF_SECONDS and candles and not need_full:
         _save_mt5_cache_throttled(force=(len(candles) >= 30))
+    if clean_m5:
+        try:
+            m5_store(asset, clean_m5)
+        except Exception as e:
+            print("m5_store:", e)
     # Cập nhật tức thì giá bid/ask/spread trên STATE["markets"] mà không cần tính lại toàn bộ 400 nến mỗi tick
     if tick and tick.get("bid") is not None:
         with STATE_LOCK:
@@ -1098,6 +1121,280 @@ def stats_status(rid):
         return out
 
 
+# ---- Kho nến M5 lâu dài (đo MFE/MAE cho lệnh cũ) + xin EA gửi lại nến còn thiếu ----
+M5_SEC = 300
+M5_KEEP_DAYS = 180
+M5_MAX_HOLE = 900              # hở > 15 phút giữa 2 nến trong lúc giữ lệnh -> coi là thiếu nến (trừ khi EA đã gửi lại khoảng đó)
+M5_REQ_MAX_SPAN = 3 * 86400    # mỗi yêu cầu EA tối đa 3 ngày nến
+M5_REQ_TRIES = 5
+M5_REQ_RETRY_SEC = 25          # EA nhận yêu cầu mà chưa trả kết quả sau 25s -> gửi lại
+M5_FAILED_RETRY_SEC = 6 * 3600
+M5_PRUNE = {"ts": 0}
+CANDLE_REQ = {"id": None, "picked": 0, "acked": 0}
+CANDLE_LOCK = threading.Lock()
+EA_CANDLE_REQ_MIN = (1, 33)    # EA từ bản này mới hiểu "candle_request"
+
+
+def m5_store(asset, candles):
+    """Ghi nến M5 ĐÃ ĐÓNG vào candles_m5 (t = giờ broker như EA gửi). Nến mới nhất của gói là nến đang chạy
+    (EA CopyRates từ vị trí 0) nên chỉ ghi khi đã qua giờ đóng theo giờ broker; chưa biết lệch giờ thì bỏ nến đó.
+    INSERT OR REPLACE: nến từng ghi khi còn dở (không xảy ra với luật trên) hay gói sau chuẩn hơn đều ghi đè."""
+    if not candles:
+        return 0
+    newest = max(c["t"] for c in candles)
+    off = broker_utc_offset(asset)
+    now_b = time.time() + off * 3600 if off is not None else None
+    rows = [(asset, int(c["t"]), c["o"], c["h"], c["l"], c["c"], c["v"]) for c in candles
+            if c["t"] < newest or (now_b is not None and c["t"] + M5_SEC <= now_b)]
+    if not rows:
+        return 0
+    with DB_LOCK:
+        conn = db_conn()
+        conn.executemany("INSERT OR REPLACE INTO candles_m5 (asset, t, o, h, l, c, v) VALUES (?,?,?,?,?,?,?)", rows)
+        if now_b is not None and time.time() - M5_PRUNE["ts"] > 86400:
+            M5_PRUNE["ts"] = time.time()
+            conn.execute("DELETE FROM candles_m5 WHERE t < ?", (int(now_b - M5_KEEP_DAYS * 86400),))
+        conn.commit()
+        conn.close()
+    return len(rows)
+
+
+def m5_candles_utc(asset, start, end):
+    """Nến M5 trong candles_m5 giao với [start, end] (epoch UTC), t đã quy về UTC. None nếu chưa biết lệch giờ broker."""
+    off = broker_utc_offset(asset)
+    if off is None:
+        return None
+    o = off * 3600
+    with DB_LOCK:
+        conn = db_conn()
+        rows = conn.execute("SELECT t, o, h, l, c, v FROM candles_m5 WHERE asset=? AND t>=? AND t<=? ORDER BY t",
+                            (asset, int(start + o - M5_SEC), int(end + o))).fetchall()
+        conn.close()
+    return [{"t": r["t"] - o, "o": r["o"], "h": r["h"], "l": r["l"], "c": r["c"], "v": r["v"]} for r in rows]
+
+
+def m5_req_range(start, end, off):
+    """Khoảng giờ broker [from, to] (bội số 5 phút, nới mỗi đầu 1 nến) cần có để đo lệnh giữ trong [start, end] UTC."""
+    o = off * 3600
+    return int((start + o) // M5_SEC * M5_SEC - M5_SEC), int((end + o) // M5_SEC * M5_SEC + M5_SEC)
+
+
+def _uncovered(ranges, a, b, step=M5_SEC):
+    """Các đoạn con của [a, b] không nằm trong hợp các khoảng ranges (mọi mốc là giờ mở nến, cách nhau step giây)."""
+    out, cur = [], a
+    for x, y in sorted(ranges):
+        if y < cur:
+            continue
+        if x > b:
+            break
+        if x > cur:
+            out.append((cur, x - step))
+        cur = max(cur, y + step)
+        if cur > b:
+            break
+    if cur <= b:
+        out.append((cur, b))
+    return out
+
+
+def _gap_rows(conn, asset, statuses):
+    return [dict(r) for r in conn.execute("SELECT * FROM candle_gaps WHERE asset=? AND status IN (%s)" % ",".join("?" for _ in statuses),
+                                          (asset,) + tuple(statuses)).fetchall()]
+
+
+def m5_fetched(asset, b_from, b_to):
+    """EA đã gửi lại trọn khoảng [b_from, b_to] (giờ broker): khoảng trống còn lại là nghỉ phiên thật, chấp nhận."""
+    with DB_LOCK:
+        conn = db_conn()
+        rows = _gap_rows(conn, asset, ("done",))
+        conn.close()
+    return not _uncovered([(r["t_from"], r["t_to"]) for r in rows], b_from, b_to)
+
+
+def m5_window_ok(cs, start, end):
+    """Nến phủ trọn [start, end]: có nến chứa giờ vào, nến cuối cách giờ đóng ≤ 10 phút, không hở > 15 phút ở giữa."""
+    if not cs or cs[0]["t"] > start or cs[-1]["t"] + M5_SEC + 600 < end:
+        return False
+    return all(b["t"] - a["t"] <= M5_MAX_HOLE for a, b in zip(cs, cs[1:]))
+
+
+def m5_window(asset, start, end):
+    """(trạng thái, nến UTC) cho khoảng giữ lệnh: ok | fetched (EA đã gửi lại, chấp nhận chỗ hở do nghỉ phiên) |
+    missing (cần xin EA) | wait (vừa đóng, chờ EA đẩy nến) | no_offset (chưa biết lệch giờ broker)."""
+    off = broker_utc_offset(asset)
+    if off is None:
+        return "no_offset", []
+    cs = m5_candles_utc(asset, start, end) or []
+    if m5_window_ok(cs, start, end):
+        return "ok", cs
+    if m5_fetched(asset, *m5_req_range(start, end, off)):
+        return "fetched", cs
+    if end > time.time() - 900:
+        return "wait", cs
+    return "missing", cs
+
+
+def m5_request(asset, start, end, signal_id):
+    """Ghi khoảng nến còn thiếu cho lệnh [start, end] UTC vào candle_gaps (chia ≤ 3 ngày/khoảng). Trả số khoảng mới."""
+    off = broker_utc_offset(asset)
+    if off is None:
+        return 0
+    a, b = m5_req_range(start, end, off)
+    sid = str(int(signal_id))
+    now_txt = now_iso()
+    fail_cut = datetime.fromtimestamp(time.time() - M5_FAILED_RETRY_SEC).strftime("%Y-%m-%d %H:%M:%S")
+    added = []
+    with DB_LOCK:
+        conn = db_conn()
+        rows = _gap_rows(conn, asset, ("pending", "done", "failed"))
+        live = [r for r in rows if r["status"] != "failed" or (r["updated_at"] or "") >= fail_cut]
+        for r in live:       # khoảng đang chờ giao với lệnh này -> nhớ id kèo để tính lại khi EA gửi về
+            if r["status"] == "pending" and r["t_from"] <= b and r["t_to"] >= a and sid not in (r["signal_ids"] or "").split(","):
+                conn.execute("UPDATE candle_gaps SET signal_ids=? WHERE id=?",
+                             (((r["signal_ids"] + ",") if r["signal_ids"] else "") + sid, r["id"]))
+        for x, y in _uncovered([(r["t_from"], r["t_to"]) for r in live], a, b):
+            while x <= y:
+                z = min(y, x + M5_REQ_MAX_SPAN)
+                conn.execute("""INSERT INTO candle_gaps (asset, t_from, t_to, status, tries, created_at, updated_at, signal_ids)
+                                VALUES (?,?,?,'pending',0,?,?,?)""", (asset, x, z, now_txt, now_txt, sid))
+                added.append((x, z))
+                x = z + M5_SEC
+        conn.commit()
+        conn.close()
+    if added:
+        fmt_b = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%d %H:%M")
+        log("vault_piggy", "🕯️ Kèo #%s thiếu nến M5 %s → xin EA gửi lại %d khoảng (giờ broker %s → %s)." % (
+            sid, asset, len(added), fmt_b(added[0][0]), fmt_b(added[-1][1])), room="vault_room")
+    return len(added)
+
+
+def _ver_tuple(v):
+    try:
+        return tuple(int(x) for x in str(v or "").strip().split(".")[:2])
+    except ValueError:
+        return (0,)
+
+
+def candle_pending_for_ea():
+    """Gắn vào phản hồi /api/push_account: 1 yêu cầu nến M5 còn thiếu (cũ nhất trước). Gửi lại sau 25s nếu EA chưa trả."""
+    with MT5_LOCK:
+        acc = MT5_ACCOUNT["data"] or {}
+    if _ver_tuple(acc.get("ea_version")) < EA_CANDLE_REQ_MIN:
+        return None              # EA cũ không hiểu yêu cầu: giữ nguyên hàng chờ, không đốt lượt thử
+    now = time.time()
+    with CANDLE_LOCK:
+        if CANDLE_REQ["id"] and now - CANDLE_REQ["picked"] < M5_REQ_RETRY_SEC:
+            return None
+        with DB_LOCK:
+            conn = db_conn()
+            r = conn.execute("SELECT * FROM candle_gaps WHERE status='pending' ORDER BY id LIMIT 1").fetchone()
+            if r and r["tries"] >= M5_REQ_TRIES:
+                conn.execute("UPDATE candle_gaps SET status='failed', updated_at=?, error=? WHERE id=?",
+                             (now_iso(), (r["error"] or "EA không trả nến sau %d lần" % M5_REQ_TRIES)[:200], r["id"]))
+            elif r:
+                conn.execute("UPDATE candle_gaps SET tries=tries+1, updated_at=? WHERE id=?", (now_iso(), r["id"]))
+            conn.commit()
+            conn.close()
+        if not r or r["tries"] >= M5_REQ_TRIES:
+            CANDLE_REQ.update(id=None, picked=0, acked=0)
+            if r:
+                log("vault_piggy", "⚠️ Bỏ yêu cầu nến M5 #%d %s sau %d lần EA không trả." % (r["id"], r["asset"], M5_REQ_TRIES), room="vault_room")
+            return None
+        CANDLE_REQ.update(id=r["id"], picked=now, acked=0)
+    with MT5_LOCK:
+        t = MT5_TICK.get(r["asset"])
+        sym = t["symbol"] if t else ""
+    if not sym:
+        sym = CONFIG.get("ea_gold_symbol") if r["asset"] == "XAUUSD" else CONFIG.get("ea_btc_symbol")
+    return {"id": r["id"], "asset": r["asset"], "symbol": sym or r["asset"], "from": r["t_from"], "to": r["t_to"]}
+
+
+def receive_candles_m5(p):
+    """POST /api/push_candles_m5 từ EA: {"id","stage":"ack"|"error"} hoặc {"id","asset","symbol","from","to","candles":[{t,o,h,l,c,v}]}."""
+    rid = int(_num(p.get("id"), int, 0) or 0)
+    with DB_LOCK:
+        conn = db_conn()
+        r = conn.execute("SELECT * FROM candle_gaps WHERE id=?", (rid,)).fetchone()
+        conn.close()
+    if not r:
+        return {"ok": False, "error": "không có yêu cầu nến #%d" % rid}
+    r = dict(r)
+    if r["status"] == "done":
+        return {"ok": True, "duplicate": True}
+    if r["status"] != "pending":
+        return {"ok": False, "error": "yêu cầu nến #%d đã %s" % (rid, r["status"])}
+    stage = p.get("stage")
+    if stage == "ack":
+        with CANDLE_LOCK:
+            if CANDLE_REQ["id"] == rid:
+                CANDLE_REQ["acked"] = time.time()
+        return {"ok": True}
+    if stage == "error":
+        err = str(p.get("error") or "")[:200]
+        with CANDLE_LOCK:
+            if CANDLE_REQ["id"] == rid:
+                CANDLE_REQ["picked"] = time.time() - M5_REQ_RETRY_SEC + 5      # cho EA thử lại sau ~5s
+        with DB_LOCK:
+            conn = db_conn()
+            conn.execute("UPDATE candle_gaps SET error=?, updated_at=? WHERE id=?", (err, now_iso(), rid))
+            conn.commit()
+            conn.close()
+        log("vault_piggy", "⚠️ EA lấy nến M5 #%d lỗi: %s" % (rid, err), room="vault_room")
+        return {"ok": True}
+    if str(p.get("asset") or "").upper() != r["asset"] or not isinstance(p.get("candles"), list):
+        return {"ok": False, "error": "sai asset hoặc thiếu candles"}
+    off = broker_utc_offset(r["asset"])
+    now_b = time.time() + off * 3600 if off is not None else None
+    rows = []
+    for c in p["candles"]:
+        try:
+            t = int(c["t"])
+            o, h, l, cl, v = float(c["o"]), float(c["h"]), float(c["l"]), float(c["c"]), float(c.get("v") or 0.0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if t % M5_SEC or not (r["t_from"] - M5_SEC <= t <= r["t_to"]) or (now_b is not None and t + M5_SEC > now_b):
+            continue             # ngoài khoảng xin hoặc nến chưa đóng
+        if min(o, h, l, cl) <= 0 or h < max(o, cl, l) or l > min(o, cl):
+            continue
+        rows.append((r["asset"], t, o, h, l, cl, max(v, 0.0)))
+    with DB_LOCK:
+        conn = db_conn()
+        if rows:
+            conn.executemany("INSERT OR REPLACE INTO candles_m5 (asset, t, o, h, l, c, v) VALUES (?,?,?,?,?,?,?)", rows)
+        conn.execute("UPDATE candle_gaps SET status='done', n_candles=?, updated_at=?, error='' WHERE id=?", (len(rows), now_iso(), rid))
+        conn.commit()
+        conn.close()
+    with CANDLE_LOCK:
+        if CANDLE_REQ["id"] == rid:
+            CANDLE_REQ.update(id=None, picked=0, acked=0)
+    sids = [int(x) for x in (r["signal_ids"] or "").split(",") if x.strip().isdigit()]
+    measured = []
+    for sid in sids:
+        try:
+            if update_outcome_mfe(sid) is not None:
+                measured.append(sid)
+        except Exception as e:
+            print("update_outcome_mfe:", e)
+    log("vault_piggy", "🕯️ EA gửi %d nến M5 %s (yêu cầu #%d) → đo được MFE/MAE %s." % (
+        len(rows), r["asset"], rid, ", ".join("#%d" % i for i in measured) if measured else "chưa thêm kèo nào"), room="vault_room")
+    return {"ok": True, "stored": len(rows), "measured": measured}
+
+
+def m5_store_status():
+    with DB_LOCK:
+        conn = db_conn()
+        cnt = {r["asset"]: {"rows": r["n"], "from": r["a"], "to": r["b"]} for r in conn.execute(
+            "SELECT asset, COUNT(*) AS n, MIN(t) AS a, MAX(t) AS b FROM candles_m5 GROUP BY asset").fetchall()}
+        gaps = {r["status"]: r["n"] for r in conn.execute("SELECT status, COUNT(*) AS n FROM candle_gaps GROUP BY status").fetchall()}
+        conn.close()
+    fmt_b = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%d %H:%M") if t else ""
+    for v in cnt.values():
+        v["from"], v["to"] = fmt_b(v["from"]), fmt_b(v["to"])
+    with MT5_LOCK:
+        ver = (MT5_ACCOUNT["data"] or {}).get("ea_version", "")
+    return {"assets": cnt, "gaps": gaps, "ea_version": ver, "ea_supports_request": _ver_tuple(ver) >= EA_CANDLE_REQ_MIN}
+
+
 EA_INT_KEYS = ("ea_poll_seconds", "ea_web_timeout_ms", "ea_tick_interval_ms", "ea_candle_interval_sec", "ea_bridge_bars",
                "ea_min_confidence", "ea_max_signal_age_sec", "ea_max_open_per_symbol", "ea_breakeven_buffer_pts",
                "ea_magic", "ea_slippage_points")
@@ -1144,13 +1441,16 @@ def fetch_mt5(asset, tf):
     raw_candles = f["candles"]
     candles = list(raw_candles[:-1]) + [dict(raw_candles[-1])]
     if t and now - t["ts"] < stale:
-        # cập nhật nến cuối bằng tick mới nhất để giá realtime
+        # cập nhật nến cuối bằng tick mới nhất để giá realtime — trừ khi nến đó đã đóng (EA chưa kịp đẩy nến mới):
+        # tick thuộc nến mới, ghi vào nến đã đóng sẽ làm sai nến mà chỉ báo đang dùng
         last = candles[-1]
-        last["c"] = t["last"]
-        if t["last"] > last["h"]:
-            last["h"] = t["last"]
-        if t["last"] < last["l"]:
-            last["l"] = t["last"]
+        forming, _ = bar_progress(last["t"], TF_SECONDS.get(tf, 300), broker_utc_offset(asset))
+        if forming:
+            last["c"] = t["last"]
+            if t["last"] > last["h"]:
+                last["h"] = t["last"]
+            if t["last"] < last["l"]:
+                last["l"] = t["last"]
         ticker = {"price": t["last"], "bid": t["bid"], "ask": t["ask"], "spread": t["spread"],
                   "change_pct": t["change_pct"], "high24": t["high24"], "low24": t["low24"], "volume24": t["volume24"]}
     else:
@@ -1160,6 +1460,21 @@ def fetch_mt5(asset, tf):
                   "high24": max(c["h"] for c in day), "low24": min(c["l"] for c in day),
                   "volume24": sum(c["v"] for c in day)}
     return candles, ticker, "mt5:" + f["symbol"]
+
+
+def bar_progress(t, sec, off):
+    """(nến bắt đầu lúc t còn đang chạy?, tỷ lệ thời gian đã trôi 0..1 hoặc None). t theo giờ nến = UTC + off giờ.
+    off None (chưa biết lệch giờ broker): coi nến cuối là đang chạy (EA lấy nến từ vị trí 0); broker lệch số giờ chẵn
+    nên với khung ≤ 1h phần dư (now - t) % sec vẫn đúng là thời gian đã trôi."""
+    now = time.time()
+    if off is not None:
+        el = now + off * 3600 - t
+        if el >= sec:
+            return False, None
+        return True, min(1.0, max(0.0, el / float(sec)))
+    if 3600 % sec == 0:
+        return True, ((now - t) % sec) / float(sec)
+    return True, None
 
 
 MARKET_CACHE = {}
@@ -1189,18 +1504,23 @@ def fetch_market(asset, tf, max_age=45, publish=True):
             candles, ticker, source = fn(asset, tf)
             if len(candles) < 30:
                 raise RuntimeError("Quá ít nến (%d)" % len(candles))
-            off = broker_offset_or_utc(asset, "VWAP phiên") if source.startswith("mt5:") else 0
+            is_mt5 = source.startswith("mt5:")
+            off = broker_offset_or_utc(asset, "VWAP phiên") if is_mt5 else 0
             last_c = candles[-1]
             prev_t = candles[-2]["t"] if len(candles) > 1 else 0
+            # Chỉ báo tính trên nến ĐÃ ĐÓNG; nến cuối còn chạy thì chỉ dùng cho giá realtime và RVOL quy đổi
+            forming, frac = bar_progress(last_c["t"], TF_SECONDS[tf], broker_utc_offset(asset) if is_mt5 else 0)
             # Chữ ký nến: nếu nến cuối chưa đổi OHLC (hoặc biến động < 1e-6) thì tái sử dụng kết quả chỉ báo đã tính
             ind_sig = (source, len(candles), prev_t, last_c["t"],
-                       round(last_c["o"], 4), round(last_c["h"], 4), round(last_c["l"], 4), round(last_c["c"], 4), off)
+                       round(last_c["o"], 4), round(last_c["h"], 4), round(last_c["l"], 4), round(last_c["c"], 4), off,
+                       forming, round(last_c.get("v") or 0.0, 2), int((frac or 0) * 20), round(ticker.get("price") or 0, 6))
             with MARKET_CACHE_LOCK:
                 ic = _IND_CACHE.get(key)
             if ic and ic.get("sig") == ind_sig:
                 ind = ic["ind"]
             else:
-                ind = compute_indicators(candles, utc_offset_hours=off)
+                ind = compute_indicators(candles, utc_offset_hours=off, closed_only=True, last_forming=forming,
+                                         live_frac=frac, live_price=ticker.get("price"))
                 with MARKET_CACHE_LOCK:
                     _IND_CACHE[key] = {"sig": ind_sig, "ind": ind}
             data = {"asset": asset, "label": ASSETS[asset]["label"], "timeframe": tf, "source": source,
@@ -1496,7 +1816,17 @@ def swing_points(candles, k=2):
     return highs, lows
 
 
-def compute_indicators(candles, utc_offset_hours=0):
+LIVE_FRAC_MIN = 0.2       # RVOL nến đang chạy: chưa trôi 20% thời gian nến thì vẫn chia cho 20% (tránh nhân phóng đại vài tick đầu nến)
+
+
+def compute_indicators(candles, utc_offset_hours=0, closed_only=False, last_forming=True, live_frac=None, live_price=None):
+    """closed_only=True: EMA/RSI/ATR/VWAP/swing/BOS/sweep/VSA/RVOL tính trên nến ĐÃ ĐÓNG. Nếu nến cuối đang chạy
+    (last_forming) thì bỏ nó khỏi phân tích, chỉ dùng cho giá hiện tại và "vol_ratio_live" (volume nến đang chạy so với
+    TB20 × tỷ lệ thời gian đã trôi live_frac). live_price: giá tick realtime (mặc định = close nến cuối)."""
+    live = None
+    if closed_only and last_forming and len(candles) > 31:
+        live = candles[-1]
+        candles = candles[:-1]
     closes = [c["c"] for c in candles]
     e20, e50, e200 = ema(closes, 20), ema(closes, 50), ema(closes, 200)
     vwap, vup, vlo, sd, n_sess = session_vwap(candles, sigma_mult=1.5, utc_offset_hours=utc_offset_hours)
@@ -1507,8 +1837,8 @@ def compute_indicators(candles, utc_offset_hours=0):
     last20 = candles[-21:-1] if len(candles) > 21 else candles[:-1]
     swing_high = max(c["h"] for c in last20)
     swing_low = min(c["l"] for c in last20)
-    price = closes[-1]
-    prev_close = closes[-2]
+    price = float(live_price) if live_price else (live["c"] if live else closes[-1])
+    prev_close = closes[-1] if live else closes[-2]
     # Cấu trúc EMA
     if e20[-1] > e50[-1] > e200[-1]:
         structure = "UPTREND"
@@ -1525,7 +1855,7 @@ def compute_indicators(candles, utc_offset_hours=0):
         vwap_zone = "BELOW_VWAP"
     else:
         vwap_zone = "BELOW_LOWER"
-    # Liquidity sweep: nến gần nhất đâm qua swing rồi đóng ngược lại
+    # Liquidity sweep: nến (đã đóng) gần nhất đâm qua swing rồi đóng ngược lại
     last = candles[-1]
     sweep = "NONE"
     if last["h"] > swing_high and last["c"] < swing_high:
@@ -1549,6 +1879,16 @@ def compute_indicators(candles, utc_offset_hours=0):
     vol_ratio = vol_cur / vol_ma20 if vol_ma20 > 0 else 1.0
     vols_last3 = [max(float(c.get("v") or 0.0), 0.0) for c in candles[-3:]]
     vol_ratio_3 = (sum(vols_last3) / max(1, len(vols_last3))) / vol_ma20 if vol_ma20 > 0 else 1.0
+    # Nến đang chạy: volume tới giờ so với TB20 nến đã đóng gần nhất, quy theo phần thời gian đã trôi
+    vol_live = max(float(live.get("v") or 0.0), 0.0) if live else None
+    vol_ratio_live = None
+    live_range_atr = None
+    if live:
+        vols_live20 = [max(float(c.get("v") or 0.0), 0.0) for c in candles[-20:]]
+        ma_live = sum(vols_live20) / len(vols_live20) if vols_live20 else 0.0
+        if ma_live > 0 and live_frac is not None:
+            vol_ratio_live = vol_live / (ma_live * max(float(live_frac), LIVE_FRAC_MIN))
+        live_range_atr = (live["h"] - live["l"]) / a if a else 0.0
 
     # Ước lượng Volume Delta (chênh lệch dòng tiền mua/bán chủ động trên 10 nến gần nhất)
     buy_vol_10, sell_vol_10 = 0.0, 0.0
@@ -1612,6 +1952,14 @@ def compute_indicators(candles, utc_offset_hours=0):
         "vol_ratio_3": round(vol_ratio_3, 2),
         "vol_delta_ratio": round(vol_delta_ratio, 3),
         "vsa_signal": vsa_signal,
+        # Nến đang chạy (không dùng cho VSA/BOS/sweep)
+        "closed_only": bool(closed_only),
+        "bar_forming": live is not None,
+        "bar_closed_t": candles[-1]["t"],
+        "bar_progress": round(float(live_frac), 3) if (live is not None and live_frac is not None) else None,
+        "vol_live": round(vol_live, 2) if vol_live is not None else None,
+        "vol_ratio_live": round(vol_ratio_live, 2) if vol_ratio_live is not None else None,
+        "live_range_atr": round(live_range_atr, 2) if live_range_atr is not None else None,
     }
 
 
@@ -1687,8 +2035,11 @@ def vote_volume(ind, candles):
         "vol_delta_ratio": vdelta,
         "vsa_signal": vsa,
         "fakeout_warning": vsa in ("WEAK_BREAKOUT_UP", "WEAK_BREAKOUT_DOWN"),
+        "vol_ratio_live": ind.get("vol_ratio_live"),
+        "bar_progress": ind.get("bar_progress"),
     }
-    head = "RVOL %.2f× TB20 (3 nến %.2f×), Delta dòng tiền %+.0f%%, VSA=%s" % (vr, vr3, vdelta * 100, vsa)
+    live_txt = (", nến đang chạy %.2f× quy đổi" % ind["vol_ratio_live"]) if ind.get("vol_ratio_live") is not None else ""
+    head = "RVOL nến đã đóng %.2f× TB20 (3 nến %.2f×%s), Delta dòng tiền %+.0f%%, VSA=%s" % (vr, vr3, live_txt, vdelta * 100, vsa)
     if vsa == "ABSORPTION_BULL":
         return "BUY", "%s → Cao trào hấp thụ cầu dưới đáy (Stopping Volume rút chân mạnh), cá voi gom hàng → BUY." % head, info
     if vsa == "ABSORPTION_BEAR":
@@ -1875,7 +2226,9 @@ def vote_regime(asset, ind):
     if ratio >= 2.5:
         reasons.append("ATR gấp %.1f lần trung bình" % ratio)
     if ind.get("last_range_atr", 0) >= 3.0:
-        reasons.append("nến hiện tại dài %.1f×ATR" % ind["last_range_atr"])
+        reasons.append("nến vừa đóng dài %.1f×ATR" % ind["last_range_atr"])
+    if (ind.get("live_range_atr") or 0) >= 3.0:
+        reasons.append("nến đang chạy đã dài %.1f×ATR" % ind["live_range_atr"])
     info = {"regime": regime, "adx14": round(adx14, 1), "plus_di": round(ind.get("plus_di", 0), 1),
             "minus_di": round(ind.get("minus_di", 0), 1), "bb_width_pct": round(bbp, 1), "atr_ratio": round(ratio, 2),
             "spread": cur, "spread_median": med, "spread_samples": n, "blocked": bool(reasons), "block_reasons": reasons}
@@ -2924,7 +3277,7 @@ SETUP_MIN_SHOW = 8         # setup đủ mẫu để đưa vào prompt / bảng 
 SETUP_MIN_BLOCK = 15       # setup đủ mẫu để chặn khi kỳ vọng âm
 SETUP_CACHE = {"ts": 0, "rows": None}
 SETUP_LOCK = threading.Lock()
-MFE_BACKFILL = {"ts": 0}
+MFE_BACKFILL = {}
 MFE_CLASS_VI = {"wrong_direction": "SAI HƯỚNG", "stop_too_tight": "SL QUÁ CHẶT", "good": "HƯỚNG ĐÚNG"}
 # Điều kiện "kèo được học": có lệnh khớp thật hoặc đã gửi Telegram (giống on_signal_outcome_recorded)
 LEARNED_SQL = """(s.telegram_sent = 1 OR EXISTS (SELECT 1 FROM executions e WHERE e.signal_id = s.id AND e.dry_run = 0
@@ -2971,33 +3324,12 @@ def outcome_close_epoch(oc, asset):
     return local_ts_epoch(oc.get("evaluated_at"))
 
 
-def m5_candles_utc(asset):
-    """Nến MT5 M5 của tài sản với t đã quy về UTC. [] nếu chưa có nến MT5 hoặc chưa biết lệch giờ broker."""
-    with MT5_LOCK:
-        f = MT5_FEED.get((asset, "5m"))
-        candles = list(f["candles"]) if f else []
-    if not candles:
-        with MARKET_CACHE_LOCK:
-            mc = MARKET_CACHE.get((asset, "5m"))
-            if mc and mc.get("all") and str(mc["data"].get("source", "")).startswith("mt5:"):
-                candles = list(mc["all"])
-    if not candles:
-        return []
-    off = broker_utc_offset(asset)
-    if off is None:
-        return []
-    return [dict(c, t=c["t"] - off * 3600) for c in candles]
-
-
-def compute_mfe_mae(asset, action, entry, sl, start, end):
-    """Mức thuận tối đa (MFE) và ngược tối đa (MAE) từ nến M5 trong [giờ vào, giờ đóng], theo giá và theo R = |entry - SL|."""
+def compute_mfe_mae(asset, action, entry, sl, start, end, cs):
+    """Mức thuận tối đa (MFE) và ngược tối đa (MAE) từ nến M5 (UTC) trong [giờ vào, giờ đóng], theo giá và theo R = |entry - SL|."""
     risk = abs(float(entry or 0) - float(sl or 0))
     if action not in ("BUY", "SELL") or not entry or risk <= 0 or not start or not end or end < start:
         return None
-    cs = m5_candles_utc(asset)
-    if not cs or cs[0]["t"] > start or cs[-1]["t"] + 300 + 600 < end:
-        return None                     # nến không phủ trọn khoảng giữ lệnh
-    win = [c for c in cs if c["t"] + 300 > start and c["t"] <= end]
+    win = [c for c in (cs or []) if c["t"] + M5_SEC > start and c["t"] <= end]
     if not win:
         return None
     hi = max(c["h"] for c in win)
@@ -3028,8 +3360,10 @@ def _real_execs(conn, signal_id):
             AND (error IS NULL OR error='') ORDER BY id ASC""", (int(signal_id),)).fetchall()]
 
 
-def update_outcome_mfe(signal_id):
-    """Tính & lưu MFE/MAE + nhãn cho 1 kèo đã có kết quả win/loss. Trả dict kết quả hoặc None (thiếu nến/thông tin)."""
+def update_outcome_mfe(signal_id, request_missing=True):
+    """Tính & lưu MFE/MAE + nhãn cho 1 kèo đã có kết quả win/loss. Trả dict kết quả hoặc None (thiếu nến/thông tin).
+    Thiếu nến M5 trong candles_m5 -> ghi khoảng cần xin EA gửi lại (request_missing); EA đã gửi lại mà vẫn không có nến
+    -> đánh dấu mfe_bars = -1 để backfill không thử mãi."""
     sid = int(signal_id)
     with DB_LOCK:
         conn = db_conn()
@@ -3045,8 +3379,21 @@ def update_outcome_mfe(signal_id):
     sl = float(ex["sl"] or 0) if ex and ex["sl"] else float(s["stop_loss"] or 0)
     start = local_ts_epoch(ex["created_at"] if ex else s["created_at"])
     end = outcome_close_epoch(oc, s["asset"])
-    res = compute_mfe_mae(s["asset"], s["action"], entry, sl, start, end)
+    if not start or not end or end < start:
+        return None
+    state, cs = m5_window(s["asset"], start, end)
+    # EA đã gửi lại: chấp nhận chỗ hở (nghỉ phiên/cuối tuần) nhưng vẫn phải có nến ngay lúc vào lệnh
+    usable = state == "ok" or (state == "fetched" and cs and cs[0]["t"] <= start + M5_MAX_HOLE)
+    res = compute_mfe_mae(s["asset"], s["action"], entry, sl, start, end, cs) if usable else None
     if not res:
+        if state == "missing" and request_missing:
+            m5_request(s["asset"], start, end, sid)
+        elif state == "fetched" and float(entry or 0) > 0 and abs(float(entry or 0) - float(sl or 0)) > 0:
+            with DB_LOCK:
+                conn = db_conn()
+                conn.execute("UPDATE signal_outcomes SET mfe_bars=-1 WHERE signal_id=? AND mfe_r IS NULL", (sid,))
+                conn.commit()
+                conn.close()
         return None
     res["mfe_class"] = classify_mfe(oc["outcome"], oc.get("exit_reason"), res["mfe_r"])
     with DB_LOCK:
@@ -3061,15 +3408,16 @@ def update_outcome_mfe(signal_id):
     return res
 
 
-def backfill_mfe(limit=40, min_gap=120):
+def backfill_mfe(limit=200, min_gap=120):
     """Bổ sung MFE/MAE cho kèo đã có kết quả nhưng lúc đóng chưa đủ nến (vd server vừa restart). Tối đa 1 lần / min_gap giây."""
-    if time.time() - MFE_BACKFILL["ts"] < min_gap:
+    if time.time() - MFE_BACKFILL.get(min_gap, 0) < min_gap:      # mốc riêng theo nơi gọi (tab Tự học / vòng nền)
         return 0
-    MFE_BACKFILL["ts"] = time.time()
+    MFE_BACKFILL[min_gap] = time.time()
     with DB_LOCK:
         conn = db_conn()
         rows = conn.execute("""SELECT o.signal_id FROM signal_outcomes o JOIN signals s ON s.id = o.signal_id
-            WHERE o.outcome IN ('win','loss') AND o.mfe_r IS NULL AND s.action IN ('BUY','SELL') AND %s
+            WHERE o.outcome IN ('win','loss') AND o.mfe_r IS NULL AND COALESCE(o.mfe_bars, 0) >= 0
+              AND s.action IN ('BUY','SELL') AND %s
             ORDER BY o.signal_id DESC LIMIT ?""" % LEARNED_SQL, (int(limit),)).fetchall()
         conn.close()
     n = 0
@@ -3095,12 +3443,16 @@ def setup_label(k, with_asset=False):
     return "%s%s | %s | %s | %s | %s" % (k[0] + " " if with_asset else "", k[1], k[2], k[3], k[4], k[5])
 
 
+def _closed_fills(exs):
+    return [e for e in exs if e.get("status") == "closed" and e.get("price") and e.get("sl") and e.get("close_price")
+            and abs(float(e["price"]) - float(e["sl"])) > 0]
+
+
 def trade_r_multiple(sig, oc, exs):
     """Kết quả kèo theo R. Có lệnh thật đã đóng: TB theo lot của (giá đóng - giá vào)/|giá vào - SL gốc|.
     Chỉ có kết quả dò nến: quy theo nhãn (EA chia đôi TP1/TP2, phần TP2 dời BE khi TP1 chạm)."""
     sign = 1.0 if sig["action"] == "BUY" else -1.0
-    closed = [e for e in exs if e.get("status") == "closed" and e.get("price") and e.get("sl") and e.get("close_price")
-              and abs(float(e["price"]) - float(e["sl"])) > 0]
+    closed = _closed_fills(exs)
     if closed:
         num = den = 0.0
         for e in closed:
@@ -3131,7 +3483,7 @@ def learned_trades(asset=None, limit=2000):
     """Các kèo đã có kết quả win/loss thuộc diện được học, kèm khoá setup và R. Mới nhất trước."""
     q = """SELECT s.id, s.asset, s.action, s.entry, s.stop_loss, s.rr1, s.rr2, s.confidence, s.created_at, s.indicators_json,
                o.outcome, o.exit_reason, o.close_price, o.close_time, o.net_profit, o.source, o.evaluated_at,
-               o.mfe, o.mae, o.mfe_r, o.mae_r, o.mfe_class
+               o.mfe, o.mae, o.mfe_r, o.mae_r, o.mfe_class, o.mfe_bars
         FROM signal_outcomes o JOIN signals s ON s.id = o.signal_id
         WHERE o.outcome IN ('win','loss') AND s.action IN ('BUY','SELL') AND %s%s
         ORDER BY s.id DESC LIMIT ?""" % (LEARNED_SQL, " AND s.asset=?" if asset else "")
@@ -3153,10 +3505,22 @@ def learned_trades(asset=None, limit=2000):
             ind = json.loads(r.pop("indicators_json") or "{}")
         except Exception:
             ind = {}
-        reg = ((ind.get("ta") or {}).get("regime") or {}).get("regime")
+        reg_info = (ind.get("ta") or {}).get("regime") or {}
         ts = local_ts_epoch(r["created_at"])
-        r["setup"] = setup_key(r["asset"], r["action"], reg, ind.get("structure"), ind.get("vwap_zone"), setup_session(ts))
-        r["r"] = round(trade_r_multiple(r, r, ex_map.get(r["id"], [])), 3)
+        r["setup"] = setup_key(r["asset"], r["action"], reg_info.get("regime"), ind.get("structure"), ind.get("vwap_zone"), setup_session(ts))
+        exs = ex_map.get(r["id"], [])
+        r["r"] = round(trade_r_multiple(r, r, exs), 3)
+        # Chi phí spread theo R = spread lúc ra kèo / khoảng SL. Kèo cũ chưa lưu spread_at_signal -> spread lúc phân tích (Mèo Đo Nhịp).
+        # R tính từ giá khớp thật (mua ở ask, đóng ở bid) đã gồm spread -> không trừ lại; R theo nhãn TP/SL thì trừ.
+        spread = _num(ind.get("spread_at_signal"))
+        if spread is None:
+            spread = _num(reg_info.get("spread"))
+        ex0 = exs[0] if exs else None
+        risk = abs(float((ex0 or {}).get("price") or r["entry"] or 0) - float((ex0 or {}).get("sl") or r["stop_loss"] or 0))
+        r["spread"] = spread
+        r["cost_r"] = round(spread / risk, 3) if (spread is not None and spread >= 0 and risk > 0) else None
+        r["cost_in_fills"] = bool(_closed_fills(exs))
+        r["r_net"] = round(r["r"] - (r["cost_r"] if (r["cost_r"] and not r["cost_in_fills"]) else 0.0), 3)
         out.append(r)
     return out
 
@@ -3167,10 +3531,15 @@ def setup_stats(asset=None, min_trades=1, force=False):
         if force or SETUP_CACHE["rows"] is None or time.time() - SETUP_CACHE["ts"] > 60:
             groups = {}
             for t in learned_trades():
-                g = groups.setdefault(t["setup"], {"n": 0, "wins": 0, "sum_r": 0.0, "last_id": 0, "last_at": ""})
+                g = groups.setdefault(t["setup"], {"n": 0, "wins": 0, "sum_r": 0.0, "sum_net": 0.0, "sum_cost": 0.0, "n_cost": 0,
+                                                   "last_id": 0, "last_at": ""})
                 g["n"] += 1
                 g["wins"] += t["outcome"] == "win"
                 g["sum_r"] += t["r"]
+                g["sum_net"] += t["r_net"]
+                if t["cost_r"] is not None:
+                    g["sum_cost"] += t["cost_r"]
+                    g["n_cost"] += 1
                 if t["id"] > g["last_id"]:
                     g["last_id"], g["last_at"] = t["id"], t["created_at"]
             rows = []
@@ -3179,8 +3548,11 @@ def setup_stats(asset=None, min_trades=1, force=False):
                              "session": k[5], "label": setup_label(k), "n": g["n"], "wins": g["wins"], "losses": g["n"] - g["wins"],
                              "win_rate": round(g["wins"] * 100.0 / g["n"], 1), "exp_r": round(g["sum_r"] / g["n"], 3),
                              "sum_r": round(g["sum_r"], 2), "last_id": g["last_id"], "last_at": g["last_at"],
-                             "blocking": g["n"] >= SETUP_MIN_BLOCK and g["sum_r"] / g["n"] < 0})
-            rows.sort(key=lambda x: (-x["n"], -x["exp_r"]))
+                             # chi phí R trung bình (spread / khoảng SL) và kỳ vọng sau chi phí: luật chặn dùng kỳ vọng ròng
+                             "cost_r": round(g["sum_cost"] / g["n_cost"], 3) if g["n_cost"] else None, "cost_n": g["n_cost"],
+                             "exp_net_r": round(g["sum_net"] / g["n"], 3), "sum_net_r": round(g["sum_net"], 2),
+                             "blocking": g["n"] >= SETUP_MIN_BLOCK and g["sum_net"] / g["n"] < 0})
+            rows.sort(key=lambda x: (-x["n"], -x["exp_net_r"]))
             SETUP_CACHE["rows"], SETUP_CACHE["ts"] = rows, time.time()
         rows = SETUP_CACHE["rows"]
     return [r for r in rows if (not asset or r["asset"] == asset) and r["n"] >= min_trades]
@@ -3194,22 +3566,28 @@ def setup_lookup(key):
 
 
 def best_worst_setups(asset, k=5):
-    """Tốt = kỳ vọng dương (cao nhất trước), tệ = kỳ vọng ≤ 0 (thấp nhất trước): ít setup cũng không lẫn hai nhóm."""
+    """Tốt = kỳ vọng ròng (sau chi phí) dương, cao nhất trước; tệ = kỳ vọng ròng ≤ 0, thấp nhất trước."""
     rows = setup_stats(asset, min_trades=SETUP_MIN_SHOW)
-    best = sorted((r for r in rows if r["exp_r"] > 0), key=lambda x: -x["exp_r"])[:k]
-    worst = sorted((r for r in rows if r["exp_r"] <= 0), key=lambda x: x["exp_r"])[:k]
+    best = sorted((r for r in rows if r["exp_net_r"] > 0), key=lambda x: -x["exp_net_r"])[:k]
+    worst = sorted((r for r in rows if r["exp_net_r"] <= 0), key=lambda x: x["exp_net_r"])[:k]
     return best, worst
+
+
+def cost_txt(r):
+    return " (spread TB %.2fR)" % r["cost_r"] if r.get("cost_r") is not None else ""
 
 
 def setup_prompt_block(asset, regime, structure, vwap_zone, session):
     """Bảng 5 setup tốt nhất / 5 tệ nhất (≥ 8 lệnh) + thống kê 2 chiều của setup hiện tại, thay cho 5 bài học văn bản."""
     best, worst = best_worst_setups(asset)
-    fmt_row = lambda r: "  • %s: %d lệnh, thắng %.0f%%, kỳ vọng %+.2fR" % (r["label"], r["n"], r["win_rate"], r["exp_r"])
-    lines = ["- Khoá setup = chiều | trạng thái | cấu trúc | vùng VWAP | phiên (Á/London/NY). Chỉ tính setup ≥ %d lệnh đã đóng." % SETUP_MIN_SHOW]
+    fmt_row = lambda r: "  • %s: %d lệnh, thắng %.0f%%, kỳ vọng %+.2fR, sau chi phí %+.2fR%s" % (
+        r["label"], r["n"], r["win_rate"], r["exp_r"], r["exp_net_r"], cost_txt(r))
+    lines = ["- Khoá setup = chiều | trạng thái | cấu trúc | vùng VWAP | phiên (Á/London/NY). Chỉ tính setup ≥ %d lệnh đã đóng." % SETUP_MIN_SHOW,
+             "- Chi phí = spread lúc ra kèo / khoảng SL (lệnh khớp thật đã gồm spread trong giá khớp nên không trừ lại)."]
     if best or worst:
-        lines.append("- 5 setup TỐT nhất (kỳ vọng dương):")
+        lines.append("- 5 setup TỐT nhất (kỳ vọng sau chi phí dương):")
         lines += [fmt_row(r) for r in best] or ["  • (chưa có)"]
-        lines.append("- 5 setup TỆ nhất (kỳ vọng âm hoặc 0):")
+        lines.append("- 5 setup TỆ nhất (kỳ vọng sau chi phí âm hoặc 0):")
         lines += [fmt_row(r) for r in worst] or ["  • (chưa có)"]
     else:
         lines.append("- Chưa có setup nào đủ %d lệnh đã đóng." % SETUP_MIN_SHOW)
@@ -3217,9 +3595,9 @@ def setup_prompt_block(asset, regime, structure, vwap_zone, session):
         key = setup_key(asset, act, regime, structure, vwap_zone, session)
         r = setup_lookup(key)
         if r:
-            lines.append("- Setup hiện tại nếu %s (%s): %d lệnh, thắng %.0f%%, kỳ vọng %+.2fR%s" % (
-                act, setup_label(key), r["n"], r["win_rate"], r["exp_r"],
-                " ⛔ SẼ BỊ CHẶN (≥ %d lệnh, kỳ vọng âm)" % SETUP_MIN_BLOCK if r["blocking"] and CONFIG.get("block_negative_setups", True) else
+            lines.append("- Setup hiện tại nếu %s (%s): %d lệnh, thắng %.0f%%, kỳ vọng %+.2fR, sau chi phí %+.2fR%s%s" % (
+                act, setup_label(key), r["n"], r["win_rate"], r["exp_r"], r["exp_net_r"], cost_txt(r),
+                " ⛔ SẼ BỊ CHẶN (≥ %d lệnh, kỳ vọng sau chi phí âm)" % SETUP_MIN_BLOCK if r["blocking"] and CONFIG.get("block_negative_setups", True) else
                 ("" if r["n"] >= SETUP_MIN_SHOW else " (chưa đủ mẫu)")))
         else:
             lines.append("- Setup hiện tại nếu %s (%s): chưa có lệnh nào." % (act, setup_label(key)))
@@ -3306,8 +3684,8 @@ def learning_guards(asset, action, ind, ta):
                         ind.get("vwap_zone"), setup_session(time.time()))
         r = setup_lookup(key)
         if r and r["blocking"]:
-            reasons.append("Setup âm: %s có %d lệnh, thắng %.0f%%, kỳ vọng %+.2fR < 0" % (
-                setup_label(key, True), r["n"], r["win_rate"], r["exp_r"]))
+            reasons.append("Setup âm: %s có %d lệnh, thắng %.0f%%, kỳ vọng sau chi phí %+.2fR < 0 (trước chi phí %+.2fR)" % (
+                setup_label(key, True), r["n"], r["win_rate"], r["exp_net_r"], r["exp_r"]))
     return reasons
 
 
@@ -3340,11 +3718,12 @@ def learning_report():
     return {"generated_at": now_iso(),
             "config": {k: CONFIG.get(k, DEFAULT_CONFIG[k]) for k in ("max_same_dir_open", "cooldown_after_sl_min", "block_negative_setups")},
             "thresholds": {"wrong_r": MFE_WRONG_R, "tight_r": MFE_TIGHT_R, "min_show": SETUP_MIN_SHOW, "min_block": SETUP_MIN_BLOCK},
-            "guards": guards, "setups": setup_stats(force=True),
+            "guards": guards, "setups": setup_stats(force=True), "m5": m5_store_status(),
             "mfe": {"total": len(recent), "measured": measured, "counts": counts, "pct": pct,
                     "rows": [{"signal_id": t["id"], "asset": t["asset"], "action": t["action"], "outcome": t["outcome"],
                               "exit_reason": t["exit_reason"], "r": t["r"], "mfe": t["mfe"], "mae": t["mae"], "mfe_r": t["mfe_r"],
                               "mae_r": t["mae_r"], "mfe_class": t["mfe_class"] or "", "setup": setup_label(t["setup"]),
+                              "cost_r": t["cost_r"], "r_net": t["r_net"], "no_candles": (t.get("mfe_bars") or 0) < 0,
                               "created_at": t["created_at"]} for t in recent]}}
 
 
@@ -3701,8 +4080,8 @@ def ta_prompt_block(asset, ta, votes):
                      "; ".join("%s %s (%+.1f)" % (l["name"], l["price"], l["dist_atr"]) for l in near))
     vol = ta.get("volume") or {}
     if vol:
-        lines.append("- Khối lượng & VSA (Cá Voi Volume): RVOL hiện tại %.2f× TB20 (3 nến %.2f×) | Volume Delta 10 nến %+.0f%% | Tín hiệu VSA: %s%s" % (
-            float(vol.get("vol_ratio") or 1.0), float(vol.get("vol_ratio_3") or 1.0),
+        lines.append("- Khối lượng & VSA (Cá Voi Volume, nến ĐÃ ĐÓNG): RVOL %.2f× TB20 (3 nến %.2f×) | nến ĐANG CHẠY: %s | Volume Delta 10 nến %+.0f%% | Tín hiệu VSA: %s%s" % (
+            float(vol.get("vol_ratio") or 1.0), float(vol.get("vol_ratio_3") or 1.0), live_vol_txt(vol),
             float(vol.get("vol_delta_ratio") or 0.0) * 100, vol.get("vsa_signal", "NORMAL"),
             " (⚠️ CẢNH BÁO FAKEOUT CẠN VOLUME)" if vol.get("fakeout_warning") else ""))
     cs = ta.get("consensus") or {}
@@ -3714,6 +4093,14 @@ def ta_prompt_block(asset, ta, votes):
     return "\n".join(lines)
 
 
+def live_vol_txt(d):
+    """Mô tả RVOL quy đổi của nến đang chạy cho prompt/log."""
+    if d.get("vol_ratio_live") is None:
+        return "chưa đo được (không rõ thời gian đã trôi của nến)"
+    return "RVOL quy đổi %.2f× (đã trôi %.0f%% thời gian nến, volume tới giờ ÷ (TB20 × max(tỷ lệ đó, %.0f%%)))" % (
+        float(d["vol_ratio_live"]), float(d.get("bar_progress") or 0) * 100, LIVE_FRAC_MIN * 100)
+
+
 def build_prompt(asset, tf, ind, ticker, votes, news, skill_text, ta=None, setup_text=None):
     ta = ta or {}
     mem = ta.get("memory") or sl_tp_memory_block(asset)
@@ -3723,12 +4110,14 @@ def build_prompt(asset, tf, ind, ticker, votes, news, skill_text, ta=None, setup
     return """Bạn là Trưởng Nhóm Chiến Lược của một văn phòng đầu tư. Hãy chủ trì cuộc họp Bull vs Bear cho %s khung %s.
 
 ## SỐ LIỆU THỰC TẾ (GIÁ, CHỈ BÁO & VOLUME VSA)
-- Giá hiện tại: %.2f | Thay đổi 24h: %.2f%% | Cao/Thấp 24h: %.2f / %.2f
+- Giá hiện tại (tick realtime): %.2f | Thay đổi 24h: %.2f%% | Cao/Thấp 24h: %.2f / %.2f
+- Mọi chỉ báo dưới đây (VWAP, EMA, RSI, ATR, Swing, Sweep, BOS, RVOL, VSA) tính trên NẾN ĐÃ ĐÓNG; nến đang chạy chỉ dùng cho giá hiện tại và RVOL quy đổi
 - Session VWAP: %.2f | Biên trên +1.5σ: %.2f | Biên dưới -1.5σ: %.2f | Vùng: %s
 - EMA20: %.2f | EMA50: %.2f | EMA200: %.2f | Cấu trúc: %s
 - RSI(14): %.1f | ATR(14): %.2f
 - Swing High(20): %.2f | Swing Low(20): %.2f | Sweep: %s | BOS: %s
-- Khối lượng (Volume): Hiện tại %.2f / TB20 %.2f (RVOL %.2f×, TB 3 nến %.2f×) | Delta Mua-Bán 10 nến: %+.0f%% | Tín hiệu VSA: %s
+- Khối lượng nến ĐÃ ĐÓNG gần nhất: %.2f / TB20 %.2f (RVOL %.2f×, TB 3 nến đã đóng %.2f×) | Delta Mua-Bán 10 nến: %+.0f%% | Tín hiệu VSA: %s
+- Khối lượng nến ĐANG CHẠY: %s
 
 ## KHUNG LỚN, TRẠNG THÁI THỊ TRƯỜNG, MỨC GIÁ, PHIÊN & DÒNG TIỀN VOLUME
 %s
@@ -3759,7 +4148,7 @@ Bắt buộc WAIT khi kèo bị veto khung lớn, có cờ chặn biến động
         ind["swing_high"], ind["swing_low"], ind["sweep"], ind["bos"],
         float(ind.get("vol_current") or 0), float(ind.get("vol_ma20") or 0),
         float(ind.get("vol_ratio") or 1.0), float(ind.get("vol_ratio_3") or 1.0),
-        float(ind.get("vol_delta_ratio") or 0.0) * 100, ind.get("vsa_signal", "NORMAL"),
+        float(ind.get("vol_delta_ratio") or 0.0) * 100, ind.get("vsa_signal", "NORMAL"), live_vol_txt(ind),
         ta_prompt_block(asset, ta, votes) or "- (không có)",
         len(votes), votes_txt, mem.get("text", "- (chưa có)"), setup_text or "- (chưa có)",
         news_txt or "- (không có)", skill_text[:2800])
@@ -4683,7 +5072,9 @@ def run_meeting(asset):
         votes["htf_scout"] = (v, m)
         v, m, reg_info = safe_vote("regime_meter", vote_regime, asset, ind)
         votes["regime_meter"] = (v, m)
-        v, m, lv_info = safe_vote("level_mapper", vote_levels, asset, ind, market["candles"])
+        # phản ứng tại mức giá xét trên nến đã đóng (nến đang chạy chỉ cho giá hiện tại)
+        closed_c = market["candles"][:-1] if ind.get("bar_forming") else market["candles"]
+        v, m, lv_info = safe_vote("level_mapper", vote_levels, asset, ind, closed_c)
         votes["level_mapper"] = (v, m)
         v, m, vol_info = safe_vote("volume_whale", vote_volume, ind, market["candles"])
         votes["volume_whale"] = (v, m)
@@ -4784,7 +5175,8 @@ def run_meeting(asset):
                "action": decision["action"], "confidence": decision["confidence"],
                "summary": decision["summary"], "bull_argument": decision["bull_argument"],
                "bear_argument": decision["bear_argument"], "lesson_learned": decision["lesson_learned"],
-               "llm_provider": provider, "indicators": dict(ind, ta=ta), "votes": {k: v[0] for k, v in votes.items()},
+               "llm_provider": provider, "indicators": dict(ind, ta=ta, spread_at_signal=(live_tk or {}).get("spread")),
+               "votes": {k: v[0] for k, v in votes.items()},
                "telegram_sent": False}
         sig.update(plan)
         sig["id"] = db_insert_signal(sig)
@@ -4857,29 +5249,114 @@ def start_meeting(asset):
 # ============================================================================
 # 9. AUTO-PILOT 24/7 & MARKET REFRESH
 # ============================================================================
+AUTOPILOT_BAR_DELAY = 8        # họp sau khi nến đóng ~8s (EA ≥ 1.33 đẩy nến ngay khi sang nến mới)
+AUTOPILOT_BAR_WAIT = 25        # chờ thêm tối đa 25s cho tới khi feed MT5 có nến mới (EA cũ đẩy nến mỗi 15s)
+AP_OFFSET_WARNED = {"v": False}
+
+
+def autopilot_broker_offset():
+    for a in ("XAUUSD", "BTCUSDT"):
+        off = broker_utc_offset(a)
+        if off is not None:
+            return off
+    return None
+
+
+def autopilot_next_run(tf, last_close=0, interval=0, now=None, off="auto"):
+    """(mốc đóng nến epoch UTC, giờ họp, offset dùng). Mốc đóng = bội số khung tf theo giờ broker (giờ nến = UTC + off).
+    Lấy nến đầu tiên đóng sau (now - trễ) và cách mốc đóng của lần họp trước ≥ interval giây.
+    Chưa biết lệch giờ broker: coi giờ nến là UTC — đúng cho M5/M15/H1 khi broker lệch số giờ chẵn, H4 có thể lệch."""
+    now = time.time() if now is None else now
+    sec = TF_SECONDS.get(tf, 900)
+    if off == "auto":
+        off = autopilot_broker_offset()
+    o = (off or 0) * 3600
+    base = now - AUTOPILOT_BAR_DELAY
+    if last_close:
+        base = max(base, last_close + interval - 1)
+    close = (int((base + o) // sec) + 1) * sec - o
+    return close, close + AUTOPILOT_BAR_DELAY, off
+
+
+def wait_bar_in_feed(asset, tf, close_utc, off, timeout=AUTOPILOT_BAR_WAIT):
+    """Chờ feed MT5 có nến bắt đầu từ mốc close_utc (tức nến trước đã đóng hẳn và EA đã gửi bản cuối). True nếu thấy."""
+    if off is None:
+        return False
+    target = close_utc + off * 3600
+    end = time.time() + timeout
+    while True:
+        with MT5_LOCK:
+            f = MT5_FEED.get((asset, tf))
+            last_t = f["candles"][-1]["t"] if f and f.get("candles") else None
+        if last_t is None:
+            return False          # không dùng feed MT5 (Binance/Yahoo): không có gì để chờ
+        if last_t >= target:
+            return True
+        if time.time() >= end or not STATE["auto_pilot"]:
+            return False
+        time.sleep(1)
+
+
 def autopilot_loop():
+    last_close = 0          # mốc đóng nến của lần họp trước (chế độ theo nến)
+    last_run = 0            # giờ bắt đầu lần họp trước (chế độ theo chu kỳ phút)
+    mode = None
+    planned = None          # (khoá cấu hình, mốc đóng, giờ họp, offset): giữ cố định tới khi họp, không tính lại mỗi vòng
+                            # (tính lại đúng lúc now = mốc + 8s sẽ nhảy sang nến sau)
     while True:
         try:
-            if STATE["auto_pilot"]:
-                interval = max(5, int(CONFIG.get("auto_interval_min") or 30)) * 60
-                for asset in ("XAUUSD", "BTCUSDT"):
-                    if not STATE["auto_pilot"]:
-                        break
-                    ok, _ = start_meeting(asset)
-                    if ok:
-                        time.sleep(3)
-                        WORKFLOW_LOCK.acquire()
-                        WORKFLOW_LOCK.release()
-                    time.sleep(5)
-                nxt = time.time() + interval
-                with STATE_LOCK:
-                    STATE["next_auto_run"] = datetime.fromtimestamp(nxt).strftime("%H:%M:%S")
-                while time.time() < nxt and STATE["auto_pilot"]:
-                    time.sleep(2)
-            else:
+            if not STATE["auto_pilot"]:
                 with STATE_LOCK:
                     STATE["next_auto_run"] = None
+                last_close = last_run = 0
+                planned = None
                 time.sleep(3)
+                continue
+            interval = max(5, int(CONFIG.get("auto_interval_min") or 30)) * 60
+            align = bool(CONFIG.get("autopilot_align_bar_close", True))
+            tf = CONFIG.get("timeframe") or "15m"
+            if tf not in TF_SECONDS:
+                tf = "15m"
+            if (align, tf) != mode:          # đổi chế độ / khung: tính lại từ đầu
+                mode, last_close = (align, tf), 0
+            now = time.time()
+            close, off = None, None
+            if align:
+                key = (tf, interval, last_close)
+                if planned is None or planned[0] != key or now - planned[2] > 60:     # đổi cấu hình hoặc lỡ mốc quá 60s
+                    planned = (key,) + autopilot_next_run(tf, last_close, interval, now)
+                _, close, nxt, off = planned
+                if off is None and not AP_OFFSET_WARNED["v"]:
+                    AP_OFFSET_WARNED["v"] = True
+                    log("chief_strategist", "⚠️ Auto-Pilot chưa biết lệch giờ broker → tạm coi giờ nến là UTC để canh mốc đóng nến%s." % (
+                        " (khung 4h có thể lệch)" if tf == "4h" else ""))
+            else:
+                nxt = last_run + interval if last_run else now
+            with STATE_LOCK:
+                STATE["next_auto_run"] = datetime.fromtimestamp(nxt).strftime("%H:%M:%S")
+            if now < nxt:
+                time.sleep(min(2.0, nxt - now))
+                continue
+            if align:
+                last_close, planned = close, None
+                log("chief_strategist", "⏰ Nến %s đóng lúc %s → Auto-Pilot họp." % (
+                    tf, datetime.fromtimestamp(close).strftime("%H:%M:%S")))
+            for asset in ("XAUUSD", "BTCUSDT"):
+                if not STATE["auto_pilot"]:
+                    break
+                if align and not wait_bar_in_feed(asset, tf, close, off) and off is not None:
+                    with MT5_LOCK:
+                        has_feed = (asset, tf) in MT5_FEED
+                    if has_feed:
+                        log("chief_strategist", "⚠️ Sau %ds EA chưa gửi nến %s mới của %s → họp với dữ liệu hiện có." % (
+                            AUTOPILOT_BAR_DELAY + AUTOPILOT_BAR_WAIT, tf, asset))
+                ok, _ = start_meeting(asset)
+                if ok:
+                    time.sleep(3)
+                    WORKFLOW_LOCK.acquire()
+                    WORKFLOW_LOCK.release()
+                time.sleep(5)
+            last_run = time.time()           # chế độ chu kỳ phút: đếm từ lúc họp xong (như trước)
         except Exception as e:
             print("autopilot error:", e)
             time.sleep(10)
@@ -4903,6 +5380,10 @@ def market_refresh_loop():
             check_open_signals_sl_tp()
         except Exception:
             pass
+        try:
+            backfill_mfe(min_gap=600)        # đo bù MFE/MAE + xin EA nến còn thiếu cho lệnh cũ
+        except Exception as e:
+            print("backfill_mfe:", e)
         for _ in range(30):
             time.sleep(2)
             for asset in ASSETS:
@@ -5048,7 +5529,8 @@ class Handler(BaseHTTPRequestHandler):
                 with STATE_LOCK:
                     snap = json.loads(json.dumps(STATE, default=str))
                 snap["logs"] = list(LOGS)[-80:]
-                snap["config"] = {k: CONFIG.get(k) for k in ("account_balance", "risk_per_trade_pct", "timeframe", "auto_interval_min")}
+                snap["config"] = {k: CONFIG.get(k) for k in ("account_balance", "risk_per_trade_pct", "timeframe", "auto_interval_min",
+                                                              "autopilot_align_bar_close")}
                 snap["llm_ready"] = any(CONFIG.get(k) for k in ("gemini_api_key", "groq_api_key", "openrouter_api_key", "custom_api_url"))
                 snap["telegram_ready"] = bool(CONFIG.get("telegram_bot_token") and CONFIG.get("telegram_chat_id"))
                 snap["bridge"] = mt5_status()
@@ -5242,7 +5724,7 @@ class Handler(BaseHTTPRequestHandler):
                         except Exception:
                             continue
                     if k in ("telegram_send_wait", "telegram_send_photo", "telegram_listen", "agent_auto_weight", "use_mt5_balance",
-                             "telegram_alert_sl_tp", "btc_binance_fallback"):
+                             "telegram_alert_sl_tp", "btc_binance_fallback", "autopilot_align_bar_close"):
                         v = v if isinstance(v, bool) else str(v).lower() in ("1", "true", "yes", "on")
                     if k == "quant_consensus":
                         try:
@@ -5290,7 +5772,21 @@ class Handler(BaseHTTPRequestHandler):
                 hr = stats_pending_for_ea()
                 if hr:
                     res["history_request"] = hr
+                try:
+                    cr = candle_pending_for_ea()
+                except Exception:
+                    traceback.print_exc()
+                    cr = None
+                if cr:
+                    res["candle_request"] = cr
                 return self.send_json(res)
+            if path == "/api/push_candles_m5":
+                token = CONFIG.get("bridge_token") or ""
+                if token and not hmac.compare_digest((self.headers.get("X-Bridge-Token") or "").encode(), token.encode()):
+                    return self.send_json({"error": "sai bridge_token"}, 403)
+                if not body:
+                    return self.send_json({"ok": False, "error": "JSON không hợp lệ"}, 400)
+                return self.send_json(receive_candles_m5(body))
             if path == "/api/push_closed":
                 token = CONFIG.get("bridge_token") or ""
                 if token and self.headers.get("X-Bridge-Token") != token:
@@ -5406,6 +5902,14 @@ def main():
     db_init()
     load_mt5_cache()
     load_mt5_cache()
+    for a in ASSETS:          # nến M5 trong cache (giữ qua restart) -> kho candles_m5
+        with MT5_LOCK:
+            f = MT5_FEED.get((a, "5m"))
+            cached = list(f["candles"]) if f else []
+        try:
+            m5_store(a, cached)
+        except Exception as e:
+            print("m5_store (cache):", e)
     log("chief_strategist", "🏢 Văn phòng mở cửa. Khung %s · Quỹ $%s · Rủi ro %s%%/lệnh." % (
         CONFIG.get("timeframe"), "{:,.0f}".format(float(CONFIG.get("account_balance") or 0)),
         CONFIG.get("risk_per_trade_pct")), room="office")

@@ -5,6 +5,8 @@
 //|       server qua POST /api/push_price  (mặc định BẬT)             |
 //|   (2) KHỚP LỆNH: poll GET /api/signals, đặt lệnh theo SL/TP của   |
 //|       kèo, báo kết quả về POST /api/execution (mặc định DryRun)   |
+//|   (3) NẾN CŨ: server xin nến M5 còn thiếu (candle_request trong   |
+//|       phản hồi push_account) -> POST /api/push_candles_m5 (1.33)  |
 //+------------------------------------------------------------------+
 //  CÀI ĐẶT BẮT BUỘC TRƯỚC KHI CHẠY
 //  1. MT5: Tools > Options > Expert Advisors
@@ -53,8 +55,8 @@
 //  ---------------------------------------------------------------
 #property copyright "AI Trading Office"
 #property link      "https://github.com/"
-#property version   "1.32"
-#define  EA_VERSION  "1.32"
+#property version   "1.33"
+#define  EA_VERSION  "1.33"
 #property description "Cầu nối giá realtime + khớp lệnh (demo) cho AI Trading Office server"
 
 #include <Trade\Trade.mqh>
@@ -154,6 +156,8 @@ datetime g_lastFullPush   = 0;      // lần gửi đủ BridgeBars nến gần 
 bool     g_needFull       = true;   // lần sau phải gửi đủ (khởi động / vừa lỗi)
 ulong    g_lastAccountMs  = 0;      // lần gửi thông tin tài khoản gần nhất
 long     g_lastHistReqId  = 0;      // yêu cầu thống kê đã xử lý gần nhất
+long     g_lastCandleReqId= 0;      // yêu cầu nến M5 cũ đã gửi thành công gần nhất
+datetime g_lastM5Bar[2]   = {0, 0}; // giờ mở nến M5 mới nhất đã đẩy (vàng, BTC): sang nến mới thì đẩy nến ngay
 ulong    g_lockMs         = 0;
 
 //+------------------------------------------------------------------+
@@ -1476,6 +1480,13 @@ void RunPriceBridge()
   {
    if(!EnablePriceBridge) return;
    bool pushCandles = (TimeLocal() - g_lastCandlePush >= CandleIntervalSec);
+   // Sang nến M5 mới -> đẩy nến ngay để server có bản cuối của nến vừa đóng (Auto-Pilot họp ~8s sau khi nến đóng)
+   bool newBar = false;
+   datetime bar0 = (GoldSymbol != "") ? iTime(GoldSymbol, PERIOD_M5, 0) : (datetime)0;
+   if(bar0 > 0 && bar0 != g_lastM5Bar[0]) newBar = true;
+   datetime bar1 = (BtcSymbol != "") ? iTime(BtcSymbol, PERIOD_M5, 0) : (datetime)0;
+   if(bar1 > 0 && bar1 != g_lastM5Bar[1]) newBar = true;
+   if(newBar) pushCandles = true;
    // Gửi đủ nến mỗi 5 phút hoặc sau lỗi; các lần khác chỉ gửi 3 nến cuối (server tự gộp)
    bool full = g_needFull || (TimeLocal() - g_lastFullPush >= 300);
    int  bars = full ? BridgeBars : 3;
@@ -1506,6 +1517,7 @@ void RunPriceBridge()
    if(pushCandles)
      {
       g_lastCandlePush = TimeLocal();
+      if(allOk) { g_lastM5Bar[0] = bar0; g_lastM5Bar[1] = bar1; }   // lỗi thì lần sau vẫn coi là nến mới, đẩy lại
       if(full && allOk) { g_lastFullPush = TimeLocal(); g_needFull = false; }
       if(!allOk) g_needFull = true;
       UiTicker("Đã gửi nến M5/M15/H1/H4 của " + GoldSymbol + (BtcSymbol != "" ? " và " + BtcSymbol : ""));
@@ -2182,6 +2194,64 @@ void HandleHistoryRequest(const string req)
      }
   }
 
+// Server xin nến M5 của khoảng [from, to] (giờ broker, epoch) để đo MFE/MAE lệnh cũ. Giống HandleHistoryRequest:
+// xác nhận (ack) -> gửi -> chỉ nhớ id khi server trả ok; lỗi thì báo stage=error, server gửi lại yêu cầu sau ~5-25s.
+void HandleCandleRequest(const string req)
+  {
+   long id = JsonGetInt(req, "id");
+   if(id <= 0 || id == g_lastCandleReqId) return;      // chỉ bỏ qua yêu cầu ĐÃ GỬI THÀNH CÔNG
+   string asset = JsonGetString(req, "asset");
+   string sym = JsonGetString(req, "symbol");
+   datetime from = (datetime)JsonGetInt(req, "from");
+   datetime to = (datetime)JsonGetInt(req, "to");
+   string ackBody;
+   int ack = HttpPostJson(ServerUrl + "/api/push_candles_m5", "{\"id\":" + IntegerToString(id) + ",\"stage\":\"ack\"}", ackBody);
+   Print("[AITO] Nhận yêu cầu nến M5 #", id, " ", sym, " ", TimeToString(from), " -> ", TimeToString(to), " | xác nhận code=", ack);
+   string why = "";
+   if(sym == "" || !SymbolSelect(sym, true)) why = "không có symbol " + sym;
+   else if(from <= 0 || to <= from) why = "khoảng thời gian sai";
+   MqlRates r[];
+   int n = 0;
+   if(why == "")
+     {
+      ResetLastError();
+      n = CopyRates(sym, PERIOD_M5, from, to, r);
+      if(n < 0) why = "CopyRates lỗi " + IntegerToString(GetLastError()) + " (lịch sử M5 chưa tải xong?)";
+     }
+   string body;
+   if(why == "")
+     {
+      int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+      string arr = "";
+      for(int i = 0; i < n; i++)
+        {
+         double v = (r[i].real_volume > 0) ? (double)r[i].real_volume : (double)r[i].tick_volume;
+         if(i > 0) arr += ",";
+         arr += StringFormat("{\"t\":%I64d,\"o\":%s,\"h\":%s,\"l\":%s,\"c\":%s,\"v\":%s}",
+                             (long)r[i].time, BrD(r[i].open, digits), BrD(r[i].high, digits), BrD(r[i].low, digits),
+                             BrD(r[i].close, digits), BrD(v, 0));
+        }
+      string js = "{\"id\":" + IntegerToString(id) + ",\"asset\":\"" + JsonEscape(asset) + "\",\"symbol\":\"" + JsonEscape(sym) + "\"" +
+                  ",\"from\":" + IntegerToString((long)from) + ",\"to\":" + IntegerToString((long)to) +
+                  ",\"candles\":[" + arr + "]}";
+      int code = HttpPostJson(ServerUrl + "/api/push_candles_m5", js, body, 30000);
+      bool ok = (code == 200 && StringFind(body, "\"ok\": true") >= 0);
+      Print("[AITO] Gửi ", n, " nến M5 ", sym, " (yêu cầu #", id, "): ", StringLen(js) / 1024, " KB, code=", code, " ", StringSubstr(body, 0, 160));
+      if(ok)
+        {
+         g_lastCandleReqId = id;
+         UiTicker("Đã gửi " + IntegerToString(n) + " nến M5 cũ của " + sym + " cho server đo MFE/MAE");
+         return;
+        }
+      why = (code == -1 ? g_lastErrorText : "HTTP " + IntegerToString(code) + " " + StringSubstr(body, 0, 120));
+     }
+   string eb;
+   HttpPostJson(ServerUrl + "/api/push_candles_m5", "{\"id\":" + IntegerToString(id) + ",\"stage\":\"error\",\"error\":\"" +
+                JsonEscape(why) + "\"}", eb);
+   Print("[AITO] Yêu cầu nến M5 #", id, " lỗi: ", why);
+   UiTicker("Gửi nến M5 cũ lỗi: " + why);
+  }
+
 void PushAccount()
   {
    string body;
@@ -2196,6 +2266,8 @@ void PushAccount()
       if(StringLen(lk) > 2 && lk != "null") HandleLookupPositions(lk);
       string req = JsonGetRaw(body, "history_request");     // server chỉ gửi kèm khi bạn bấm xem thống kê
       if(StringLen(req) > 2 && req != "null") HandleHistoryRequest(req);
+      string creq = JsonGetRaw(body, "candle_request");     // server xin nến M5 còn thiếu để đo MFE/MAE lệnh cũ
+      if(StringLen(creq) > 2 && creq != "null") HandleCandleRequest(creq);
      }
   }
 
